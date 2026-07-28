@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script>/* Web Crypto needs a secure context: upgrade to HTTPS in production (not on localhost). */
+(function(){var h=location.hostname;if(location.protocol==="http:"&&h!=="localhost"&&h!=="127.0.0.1"){location.replace(location.href.replace(/^http:/,"https:"));}})();</script>
 <meta name="description" content="TURN Doctor — diagnose why a client can't reach a WebRTC TURN relay: UDP/TCP/TLS reachability, NAT type and credential validity." />
 <title>TURN Doctor — WebRTC TURN relay diagnostics</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -114,7 +116,7 @@
               <input id="ttl" type="number" min="60" value="3600" />
             </div>
             <div class="field">
-              <label for="suffix">Username suffix <span class="muted-tag">optional</span></label>
+              <label for="suffix">Suffix <span class="muted-tag">optional</span></label>
               <input id="suffix" type="text" spellcheck="false" placeholder="e.g. gads" />
             </div>
           </div>

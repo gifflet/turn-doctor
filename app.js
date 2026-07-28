@@ -39,6 +39,9 @@ async function resolveCredential() {
   if (mode === 'direct') {
     return { username: val('username'), password: val('password') };
   }
+  if (!window.crypto || !crypto.subtle) {
+    throw new Error('Web Crypto is unavailable. Open this page over HTTPS to derive credentials from a shared secret, or switch to Direct credential.');
+  }
   const secret = val('sharedSecret');
   return restCredential(secret, val('ttl'), val('suffix').trim());
 }
@@ -114,15 +117,16 @@ async function detectNat(primarySrflx) {
   const fb = NAT_FALLBACK_STUN.find((u) => u !== state.stun) || NAT_FALLBACK_STUN[0];
   const r = await probe({ iceServers: [{ urls: fb }], policy: 'all', want: 'srflx', timeout: 5000 });
   const other = r.candidates.find((c) => c.type === 'srflx');
-  if (!other) return { type: 'unknown', detail: 'Could not reach a second STUN server to compare.' };
+  if (!other) return { type: 'unknown', label: 'unknown', detail: 'Could not reach a second STUN server to compare mappings.' };
   const sameIp = other.address === primarySrflx.address;
   const samePort = String(other.port) === String(primarySrflx.port);
   if (sameIp && samePort) {
-    return { type: 'endpoint-independent', detail: 'Same public mapping to two different servers — P2P (srflx) is likely to work.' };
+    return { type: 'endpoint-independent', label: 'cone', detail: 'The same public mapping was seen by two different servers, so direct P2P (srflx) is likely to work.' };
   }
   return {
     type: 'address-dependent',
-    detail: `Public port changed per destination (${primarySrflx.address}:${primarySrflx.port} vs ${other.address}:${other.port}) — symmetric-style NAT. Direct P2P usually fails, so relay is required.`,
+    label: 'symmetric',
+    detail: `Your public port changed per destination (${primarySrflx.address}:${primarySrflx.port} vs ${other.address}:${other.port}), so direct P2P usually fails and relay is required.`,
   };
 }
 
@@ -220,8 +224,9 @@ function explainStun(evalRes, res, nat) {
   const s = res.candidates.find((c) => c.type === 'srflx');
   let html = `Discovered your public mapping <b class="mono">${esc(s.address)}:${esc(s.port)}</b> in ${res.firstMs} ms — STUN works and outbound UDP is not fully blocked.`;
   if (nat) {
-    const tone = nat.type === 'address-dependent' ? ' <b style="color:var(--warn)">Symmetric-style NAT.</b>' : '';
-    html += `<br><br><b>NAT mapping:</b> ${esc(nat.type)}.${tone} ${esc(nat.detail)}`;
+    const warn = nat.type === 'address-dependent' ? ' style="color:var(--warn)"' : '';
+    const label = nat.label ? ` (${esc(nat.label)})` : '';
+    html += `<br><br><b>NAT mapping:</b> <b${warn}>${esc(nat.type)}${label}</b>. ${esc(nat.detail)}`;
   }
   return { tone: evalRes.status === 'pass' ? 'pass' : 'warn', html };
 }
@@ -247,7 +252,7 @@ function computeVerdict(results, natInfo) {
   const chips = [];
   chips.push(chip('STUN', ran('stun') ? (ok('stun') ? 'pass' : 'fail') : 'skip'));
   ['udp', 'tcp', 'tls'].forEach((k) => chips.push(chip('TURN/' + k.toUpperCase(), ran(k) ? (ok(k) ? 'pass' : 'fail') : 'skip')));
-  if (natInfo) chips.push(chip('NAT: ' + (natInfo.type === 'address-dependent' ? 'symmetric' : natInfo.type === 'endpoint-independent' ? 'cone' : 'unknown'),
+  if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
 
   let status, title, text;
@@ -338,7 +343,12 @@ async function run() {
   try {
     cred = await resolveCredential();
   } catch (e) {
-    cred = { username: '', password: '' };
+    state.running = false;
+    btn.disabled = false;
+    $('span', btn).textContent = 'Run diagnostics';
+    $('#empty').classList.remove('is-hidden');
+    $('#empty').innerHTML = '<svg class="ic ic-xl" viewBox="0 0 24 24"><use href="#i-lock"/></svg><h3>HTTPS required</h3><p>' + esc(e.message) + '</p>';
+    return;
   }
 
   const enabled = {

@@ -61,17 +61,41 @@
 </header>
 
 <main class="layout">
-  <!-- ============ CONFIG ============ -->
-  <aside class="config" aria-label="Configuration">
+  <!-- ============ COMMAND ============ -->
+  <section class="command" aria-label="Configuration">
+    <div class="command-intro">
+      <h1 class="command-title">Diagnose your TURN relay</h1>
+      <p class="command-sub">Enter your TURN host and run the probes — only the host is required.</p>
+    </div>
     <form id="cfgForm" autocomplete="off" novalidate>
+      <div class="command-bar">
+        <div class="field command-host">
+          <label for="turnHost">TURN host</label>
+          <input id="turnHost" type="text" inputmode="url" spellcheck="false" placeholder="turn.example.com" />
+        </div>
+        <button type="submit" id="runBtn" class="btn-primary command-run">
+          <svg class="ic" viewBox="0 0 24 24"><use href="#i-play"/></svg>
+          <span>Run diagnostics</span>
+        </button>
+      </div>
+
+      <div class="adv-header">
+        <button type="button" id="advToggle" class="adv-toggle" aria-expanded="false" aria-controls="advanced">
+          <svg class="ic ic-sm adv-caret" viewBox="0 0 24 24"><use href="#i-chevron"/></svg>
+          <span>Advanced options</span>
+          <span class="adv-hint">ports · STUN · authentication · probes</span>
+        </button>
+        <button type="button" id="resetBtn" class="btn-ghost adv-reset" title="Reset form">
+          <svg class="ic" viewBox="0 0 24 24"><use href="#i-reset"/></svg>
+        </button>
+      </div>
+
+      <div id="advanced" class="advanced is-collapsed">
+       <div class="advanced-inner">
       <section class="panel">
         <div class="panel-head">
           <svg class="ic" viewBox="0 0 24 24"><use href="#i-server"/></svg>
-          <h2>Server</h2>
-        </div>
-        <div class="field">
-          <label for="turnHost">TURN host</label>
-          <input id="turnHost" type="text" inputmode="url" spellcheck="false" placeholder="turn.example.com" />
+          <h2>Ports &amp; STUN</h2>
         </div>
         <div class="field-row">
           <div class="field">
@@ -156,25 +180,16 @@
           <label class="check"><input type="checkbox" id="testTcp" checked /><span class="box"></span> TURN over TCP</label>
           <label class="check"><input type="checkbox" id="testTls" /><span class="box"></span> TURN over TLS</label>
         </div>
+        <div class="field ref-field">
+          <label for="reference">Reference <span class="muted-tag">optional</span></label>
+          <input id="reference" type="text" spellcheck="false" placeholder="name or ticket # for the report" />
+        </div>
       </section>
-
-      <div class="field ref-field">
-        <label for="reference">Reference <span class="muted-tag">optional · shown in the shared report</span></label>
-        <input id="reference" type="text" spellcheck="false" placeholder="name or ticket #" />
-      </div>
-
-      <div class="actions">
-        <button type="submit" id="runBtn" class="btn-primary">
-          <svg class="ic" viewBox="0 0 24 24"><use href="#i-play"/></svg>
-          <span>Run diagnostics</span>
-        </button>
-        <button type="button" id="resetBtn" class="btn-ghost" title="Reset form">
-          <svg class="ic" viewBox="0 0 24 24"><use href="#i-reset"/></svg>
-        </button>
+       </div>
       </div>
       <p class="disclaimer">Everything runs locally in your browser. Credentials never leave this page.</p>
     </form>
-  </aside>
+  </section>
 
   <!-- ============ RESULTS ============ -->
   <section class="results" aria-label="Results" aria-live="polite">

@@ -597,6 +597,7 @@ async function run() {
 
   await new Promise((r) => setTimeout(r, 600));
   splashHide();
+  setTimeout(() => { $('#verdict').scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 340);
 
   state.running = false;
   btn.disabled = false;
@@ -661,6 +662,12 @@ function init() {
     });
     document.addEventListener('click', () => { shareMenu.classList.add('is-hidden'); shareWrap.classList.remove('is-open'); shareBtn.setAttribute('aria-expanded', 'false'); });
   }
+
+  const advToggle = $('#advToggle'), advanced = $('#advanced');
+  if (advToggle) advToggle.addEventListener('click', () => {
+    const collapsed = advanced.classList.toggle('is-collapsed');
+    advToggle.setAttribute('aria-expanded', String(!collapsed));
+  });
 
   loadConfig();
 

@@ -115,6 +115,23 @@
 
       <section class="panel">
         <div class="panel-head">
+          <svg class="ic" viewBox="0 0 24 24"><use href="#i-tower"/></svg>
+          <h2>Probes</h2>
+        </div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="testStun" checked /><span class="box"></span> STUN reachability &amp; NAT</label>
+          <label class="check"><input type="checkbox" id="testUdp" checked /><span class="box"></span> TURN over UDP</label>
+          <label class="check"><input type="checkbox" id="testTcp" checked /><span class="box"></span> TURN over TCP</label>
+          <label class="check"><input type="checkbox" id="testTls" /><span class="box"></span> TURN over TLS</label>
+        </div>
+        <div class="field ref-field">
+          <label for="reference">Reference <span class="muted-tag">optional</span></label>
+          <input id="reference" type="text" spellcheck="false" placeholder="name or ticket # for the report" />
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
           <svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg>
           <h2>Authentication</h2>
           <span class="head-opt">optional</span>
@@ -166,23 +183,6 @@
               </button>
             </div>
           </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <svg class="ic" viewBox="0 0 24 24"><use href="#i-tower"/></svg>
-          <h2>Probes</h2>
-        </div>
-        <div class="checks">
-          <label class="check"><input type="checkbox" id="testStun" checked /><span class="box"></span> STUN reachability &amp; NAT</label>
-          <label class="check"><input type="checkbox" id="testUdp" checked /><span class="box"></span> TURN over UDP</label>
-          <label class="check"><input type="checkbox" id="testTcp" checked /><span class="box"></span> TURN over TCP</label>
-          <label class="check"><input type="checkbox" id="testTls" /><span class="box"></span> TURN over TLS</label>
-        </div>
-        <div class="field ref-field">
-          <label for="reference">Reference <span class="muted-tag">optional</span></label>
-          <input id="reference" type="text" spellcheck="false" placeholder="name or ticket # for the report" />
         </div>
       </section>
        </div>

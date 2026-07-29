@@ -618,6 +618,18 @@ function loadConfig() {
   if (o.authMode) setAuthMode(o.authMode);
 }
 
+// True if any advanced field holds a non-default / non-empty value worth revealing.
+function hasAdvancedValues() {
+  const filled = (id) => val(id).trim() !== '';
+  const nonDefault = (id, def) => { const v = val(id).trim(); return v !== '' && v !== def; };
+  return nonDefault('turnPort', '3478') || nonDefault('tlsPort', '5349')
+    || nonDefault('stunServer', 'stun:stun.l.google.com:19302') || nonDefault('ttl', '3600')
+    || filled('sharedSecret') || filled('username') || filled('password')
+    || filled('suffix') || filled('reference')
+    || state.authMode === 'direct'
+    || !$('#testStun').checked || !$('#testUdp').checked || !$('#testTcp').checked || $('#testTls').checked;
+}
+
 /* ---------------- UI wiring ---------------- */
 function setAuthMode(mode) {
   state.authMode = mode;
@@ -664,12 +676,14 @@ function init() {
   }
 
   const advToggle = $('#advToggle'), advanced = $('#advanced');
-  if (advToggle) advToggle.addEventListener('click', () => {
-    const collapsed = advanced.classList.toggle('is-collapsed');
-    advToggle.setAttribute('aria-expanded', String(!collapsed));
-  });
+  const setAdvanced = (open) => {
+    advanced.classList.toggle('is-collapsed', !open);
+    advToggle.setAttribute('aria-expanded', String(open));
+  };
+  if (advToggle) advToggle.addEventListener('click', () => setAdvanced(advanced.classList.contains('is-collapsed')));
 
   loadConfig();
+  if (hasAdvancedValues()) setAdvanced(true);
 
   if (!window.RTCPeerConnection) {
     $('#empty').innerHTML = '<h3>WebRTC unavailable</h3><p>This browser does not expose RTCPeerConnection, so ICE probing cannot run.</p>';

@@ -144,17 +144,17 @@ body > *:not(.bg-grid):not(.bg-glow):not(.loading-overlay) { position: relative;
 .advanced { margin-top: 14px; }
 .advanced.is-collapsed { display: none; }
 .advanced-inner {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start;
+  columns: 2; column-gap: 16px;
   animation: reveal .25s both;
 }
-.advanced-inner .panel { margin-bottom: 0; }
+.advanced-inner .panel { break-inside: avoid; margin: 0 0 16px; }
 
 .results { margin-top: 26px; }
 
 @media (max-width: 720px) {
   .command-bar { flex-direction: column; align-items: stretch; }
   .command-run { justify-content: center; }
-  .advanced-inner { grid-template-columns: 1fr; }
+  .advanced-inner { columns: 1; }
   .adv-hint { display: none; }
 }
 

@@ -301,6 +301,34 @@ function chip(label, s) {
   return `<span class="chip" data-s="${s}"><svg class="ic" viewBox="0 0 24 24"><use href="#${icon}"/></svg>${esc(label)}</span>`;
 }
 
+/* ---------------- loading splash ---------------- */
+let diagT0 = 0;
+function splashShow() {
+  diagT0 = performance.now();
+  $('#loadingLog').innerHTML = '';
+  $('#loadingBarFill').style.width = '0%';
+  $('#loadingOverlay').classList.remove('is-hidden', 'is-closing');
+}
+function splashHide() {
+  const o = $('#loadingOverlay');
+  o.classList.add('is-closing');
+  setTimeout(() => { o.classList.add('is-hidden'); o.classList.remove('is-closing'); }, 300);
+}
+function splashCurrent(msg) { $('#loadingCurrent').textContent = msg; }
+function splashProgress(done, total) {
+  $('#loadingCount').textContent = done + '/' + total;
+  $('#loadingBarFill').style.width = (total ? Math.round((done / total) * 100) : 0) + '%';
+}
+function diagLog(msg, kind) {
+  const el = $('#loadingLog');
+  const t = ((performance.now() - diagT0) / 1000).toFixed(1);
+  const line = document.createElement('div');
+  line.className = 'lg';
+  line.innerHTML = '<span class="lg-t">' + t + 's</span><span class="lg-' + (kind || 'dim') + '">' + esc(msg) + '</span>';
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
 /* ---------------- orchestration ---------------- */
 const state = { authMode: 'secret', host: '', port: 3478, tlsPort: 5349, stun: '', running: false };
 
@@ -339,10 +367,17 @@ async function run() {
   $('#empty').classList.add('is-hidden');
   saveConfig();
 
+  splashShow();
+  splashCurrent('Preparing credentials');
+  diagLog('Starting diagnostics — forcing iceTransportPolicy: relay per transport', 'run');
+
   let cred;
   try {
+    diagLog(state.authMode === 'secret' ? 'Deriving REST credential (HMAC-SHA1) from shared secret' : 'Using direct credential', 'dim');
     cred = await resolveCredential();
+    diagLog('Credential ready — username ' + (cred.username || '(none)'), 'ok');
   } catch (e) {
+    splashHide();
     state.running = false;
     btn.disabled = false;
     $('span', btn).textContent = 'Run diagnostics';
@@ -359,26 +394,47 @@ async function run() {
   };
   const defs = TEST_DEFS.filter((d) => enabled[d.key]).map((d) => ({ ...d, url: turnUrl(d.key) }));
   renderCards(defs);
+  splashProgress(0, defs.length);
 
   const results = {};
   let natInfo = null;
+  let done = 0;
 
   for (const d of defs) {
     const card = $(`.test[data-key="${d.key}"]`);
     setStatus(card, 'running');
     $('.test-time', card).textContent = '…';
+    splashCurrent(d.name);
 
     let res, evalRes, explain;
     if (d.key === 'stun') {
+      diagLog('STUN — gathering candidates via ' + state.stun, 'run');
       res = await probe({ iceServers: [{ urls: state.stun }], policy: 'all', want: 'srflx' });
       const srflx = res.candidates.find((c) => c.type === 'srflx');
-      if (srflx) natInfo = await detectNat(srflx);
+      if (srflx) {
+        diagLog('STUN — public mapping ' + srflx.address + ':' + srflx.port + ' (' + res.firstMs + ' ms)', 'ok');
+        splashCurrent('Detecting NAT mapping');
+        diagLog('NAT — comparing mappings across a second STUN server', 'run');
+        natInfo = await detectNat(srflx);
+        if (natInfo) diagLog('NAT — ' + natInfo.type + (natInfo.label ? ' (' + natInfo.label + ')' : ''), natInfo.type === 'address-dependent' ? 'warn' : 'ok');
+      } else {
+        diagLog('STUN — no reflexive candidate discovered', 'no');
+      }
       evalRes = { status: srflx ? 'pass' : 'warn', kind: srflx ? 'ok' : 'nostun' };
       explain = explainStun(evalRes, res, natInfo);
     } else {
+      diagLog(d.name + ' — allocating relay via ' + turnUrl(d.key), 'run');
       const iceServers = [{ urls: turnUrl(d.key), username: cred.username, credential: cred.password }];
       res = await probe({ iceServers, policy: 'relay', want: 'relay' });
       evalRes = evaluateTurn(res);
+      if (evalRes.status === 'pass') {
+        const relay = res.candidates.find((c) => c.type === 'relay');
+        diagLog(d.name + ' — relay ' + (relay ? relay.address + ':' + relay.port : 'allocated') + ' (' + res.firstMs + ' ms)', 'ok');
+      } else if (evalRes.kind === 'auth') {
+        diagLog(d.name + ' — credential rejected (401/403)', 'no');
+      } else {
+        diagLog(d.name + ' — no relay allocated' + (res.timedOut ? ' (timed out)' : ''), 'no');
+      }
       explain = explainTurn(d.key, evalRes, res);
     }
 
@@ -386,6 +442,8 @@ async function run() {
     const ms = res.firstMs != null ? res.firstMs : res.gatherMs;
     $('.test-time', card).textContent = (ms != null ? ms + ' ms' : '—');
     setStatus(card, evalRes.status);
+    done++;
+    splashProgress(done, defs.length);
 
     const credLine = (d.key !== 'stun' && (cred.username || cred.password)) ? `
       <p class="data-title">Credential used</p>
@@ -403,7 +461,13 @@ async function run() {
       ${credLine}`);
   }
 
+  splashCurrent('Computing verdict');
+  diagLog('All probes complete — computing verdict', 'run');
   computeVerdict(results, natInfo);
+  diagLog('Done', 'ok');
+
+  await new Promise((r) => setTimeout(r, 600));
+  splashHide();
 
   state.running = false;
   btn.disabled = false;

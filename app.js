@@ -143,8 +143,11 @@ function evaluateTurn(res, provided) {
     // With credentials, that is an auth failure; without, it is a reachability pass.
     return provided ? { status: 'fail', kind: 'auth' } : { status: 'pass', kind: 'reachable' };
   }
-  if (has(701) || res.timedOut || res.candidates.length === 0) return { status: 'fail', kind: 'unreach' };
-  return { status: 'fail', kind: 'unreach' };
+  if (has(701) || res.timedOut) return { status: 'fail', kind: 'unreach' };
+  // No relay, no 401/701, no timeout: the server most likely answered but this
+  // browser (notably Safari) hides the TURN auth error. Inconclusive without
+  // credentials; with credentials it is a genuine failure to allocate a relay.
+  return provided ? { status: 'fail', kind: 'unreach' } : { status: 'warn', kind: 'inconclusive' };
 }
 
 /* ---------------- rendering ---------------- */
@@ -236,6 +239,9 @@ function explainTurn(key, evalRes, res) {
   if (evalRes.kind === 'auth') {
     return { tone: 'fail', html: `The TURN server was reachable but <b>rejected the credential</b> (401/403). The transport itself is not blocked — fix the username/password or the shared secret and TTL, then retry.` };
   }
+  if (evalRes.kind === 'inconclusive') {
+    return { tone: 'warn', html: `The probe finished over ${proto} without a relay <b>and without a visible error</b>. Some browsers — notably <b>Safari</b> — hide TURN authentication errors, so reachability can't be confirmed here without credentials. Add a shared secret/credential, or re-run in Chrome or Firefox for a definitive answer.` };
+  }
   return { tone: 'fail', html: `No <code>relay</code> candidate was allocated over ${proto}${res.timedOut ? ' (timed out)' : ''}. Either this network blocks ${proto} to the TURN port, or the server is not listening on that transport. If other transports pass, the problem is network filtering on this path.` };
 }
 
@@ -274,18 +280,27 @@ function computeVerdict(results, natInfo, credProvided) {
 
   const chips = [];
   chips.push(chip('STUN', ran('stun') ? (reachOk('stun') ? 'pass' : 'fail') : 'skip'));
-  ['udp', 'tcp', 'tls'].forEach((k) => chips.push(chip('TURN/' + k.toUpperCase(), ran(k) ? (reachOk(k) ? 'pass' : 'fail') : 'skip')));
+  ['udp', 'tcp', 'tls'].forEach((k) => {
+    let s = 'skip';
+    if (ran(k)) s = reachOk(k) ? 'pass' : (results[k].eval.kind === 'inconclusive' ? 'warn' : 'fail');
+    chips.push(chip('TURN/' + k.toUpperCase(), s));
+  });
   if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
 
   let status, title, text;
 
   if (anyTurnRan && !credProvided) {
+    const anyInconclusive = ['udp', 'tcp', 'tls'].some((k) => results[k] && results[k].eval && results[k].eval.kind === 'inconclusive');
     if (anyReachOk) {
       const reached = ['udp', 'tcp', 'tls'].filter(reachOk).map((k) => k.toUpperCase()).join(', ');
       status = 'pass';
       title = 'TURN is reachable — credentials not tested';
       text = 'The server answered the allocation request (401) over ' + reached + ', which proves this network lets you reach the TURN server on those transports — they are not blocked. Relay allocation was not verified because no credentials were provided; add a shared secret or credential to confirm a working relay.';
+    } else if (anyInconclusive) {
+      status = 'warn';
+      title = 'Reachability inconclusive in this browser';
+      text = 'The TURN probes finished without a relay and without a visible error. Safari hides TURN authentication errors, so reachability cannot be confirmed here without credentials. Add a shared secret or credential (a real relay allocation is visible in every browser), or re-run in Chrome or Firefox for a definitive result.';
     } else {
       status = 'fail';
       title = 'TURN is unreachable on every tested transport';
@@ -342,7 +357,8 @@ let lastRun = null;
 function buildReport(results, natInfo, cred, verdict) {
   const PROBE_LABEL = { stun: 'STUN reachability & NAT', udp: 'TURN over UDP', tcp: 'TURN over TCP', tls: 'TURN over TLS' };
   const resultWord = (ev) => ev.kind === 'ok' ? 'pass (relay)' : ev.kind === 'reachable' ? 'pass (reachable)'
-    : ev.kind === 'auth' ? 'fail (401)' : ev.status === 'pass' ? 'pass' : ev.status === 'warn' ? 'warn' : 'fail';
+    : ev.kind === 'inconclusive' ? 'inconclusive' : ev.kind === 'auth' ? 'fail (401)'
+    : ev.status === 'pass' ? 'pass' : ev.status === 'warn' ? 'warn' : 'fail';
   const stunRes = results.stun && results.stun.res;
   const srflxes = stunRes ? stunRes.candidates.filter((c) => c.type === 'srflx' && c.address) : [];
   const v4 = srflxes.find((c) => c.address.indexOf(':') < 0);
@@ -359,6 +375,8 @@ function buildReport(results, natInfo, cred, verdict) {
       detail = relay ? 'relay ' + relay.address + ':' + relay.port : 'relay allocated';
     } else if (ev.kind === 'reachable') {
       detail = 'answered 401 (no credentials provided)';
+    } else if (ev.kind === 'inconclusive') {
+      detail = 'no relay, no visible error (browser may hide TURN errors)';
     } else if (ev.kind === 'auth') {
       detail = 'credential rejected (401/403)';
     } else {
@@ -560,6 +578,8 @@ async function run() {
         diagLog(d.name + ' — reachable (401 — no credentials provided)', 'ok');
       } else if (evalRes.kind === 'auth') {
         diagLog(d.name + ' — credential rejected (401/403)', 'no');
+      } else if (evalRes.kind === 'inconclusive') {
+        diagLog(d.name + ' — inconclusive (no relay, no visible error — browser may hide TURN errors)', 'warn');
       } else {
         diagLog(d.name + ' — no response' + (res.timedOut ? ' (timed out)' : ''), 'no');
       }

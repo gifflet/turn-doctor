@@ -69,14 +69,14 @@
     </div>
     <form id="cfgForm" autocomplete="off" novalidate>
       <div class="command-bar">
-        <div class="field command-host">
-          <label for="turnHost">TURN host</label>
-          <input id="turnHost" type="text" inputmode="url" spellcheck="false" placeholder="turn.example.com" />
+        <label for="turnHost" class="command-label">TURN host</label>
+        <div class="command-row">
+          <input id="turnHost" class="command-host" type="text" inputmode="url" spellcheck="false" placeholder="turn.example.com" />
+          <button type="submit" id="runBtn" class="btn-primary command-run">
+            <svg class="ic" viewBox="0 0 24 24"><use href="#i-play"/></svg>
+            <span>Run diagnostics</span>
+          </button>
         </div>
-        <button type="submit" id="runBtn" class="btn-primary command-run">
-          <svg class="ic" viewBox="0 0 24 24"><use href="#i-play"/></svg>
-          <span>Run diagnostics</span>
-        </button>
       </div>
 
       <div class="adv-header">

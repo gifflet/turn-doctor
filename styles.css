@@ -120,14 +120,17 @@ body > *:not(.bg-grid):not(.bg-glow):not(.loading-overlay) { position: relative;
 .command-sub { margin: 8px auto 0; max-width: 520px; color: var(--muted); font-size: 14.5px; }
 
 .command-bar {
-  display: flex; gap: 12px; align-items: flex-end;
   background: linear-gradient(180deg, var(--surface) 0%, #0F1418 100%);
   border: 1px solid var(--border-strong); border-radius: var(--radius);
   padding: 16px; box-shadow: var(--shadow);
 }
-.command-host { flex: 1; margin: 0; }
-.command-host input { font-size: 15px; padding: 12px 14px; }
-.command-run { flex: none; padding: 13px 22px; }
+.command-label {
+  display: block; font-size: 11.5px; font-weight: 600; color: var(--muted);
+  letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 8px;
+}
+.command-row { display: flex; gap: 12px; align-items: stretch; }
+.command-host { flex: 1; font-size: 15px; height: 48px; padding: 0 14px; }
+.command-run { flex: none; height: 48px; padding: 0 22px; }
 
 .adv-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 14px 4px 0; }
 .adv-toggle {
@@ -152,7 +155,7 @@ body > *:not(.bg-grid):not(.bg-glow):not(.loading-overlay) { position: relative;
 .results { margin-top: 26px; }
 
 @media (max-width: 720px) {
-  .command-bar { flex-direction: column; align-items: stretch; }
+  .command-row { flex-direction: column; align-items: stretch; }
   .command-run { justify-content: center; }
   .advanced-inner { columns: 1; }
   .adv-hint { display: none; }

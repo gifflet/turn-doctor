@@ -117,7 +117,7 @@
             </div>
             <div class="field">
               <label for="suffix">Suffix <span class="muted-tag">optional</span></label>
-              <input id="suffix" type="text" spellcheck="false" placeholder="e.g. gads" />
+              <input id="suffix" type="text" spellcheck="false" placeholder="e.g. app" />
             </div>
           </div>
           <p class="hint"><svg class="ic ic-sm" viewBox="0 0 24 24"><use href="#i-info"/></svg><span>Ephemeral credentials are derived in your browser as <code>username = expiry[:suffix]</code> and <code>password = base64(HMAC-SHA1(secret, username))</code>.</span></p>
@@ -149,7 +149,7 @@
           <label class="check"><input type="checkbox" id="testStun" checked /><span class="box"></span> STUN reachability &amp; NAT</label>
           <label class="check"><input type="checkbox" id="testUdp" checked /><span class="box"></span> TURN over UDP</label>
           <label class="check"><input type="checkbox" id="testTcp" checked /><span class="box"></span> TURN over TCP</label>
-          <label class="check"><input type="checkbox" id="testTls" checked /><span class="box"></span> TURN over TLS</label>
+          <label class="check"><input type="checkbox" id="testTls" /><span class="box"></span> TURN over TLS</label>
         </div>
       </section>
 

@@ -415,14 +415,12 @@ const SAVE_KEYS = ['turnHost', 'turnPort', 'tlsPort', 'stunServer', 'ttl', 'suff
 function saveConfig() {
   const o = { authMode: state.authMode };
   SAVE_KEYS.forEach((k) => (o[k] = val(k)));
-  ['testStun', 'testUdp', 'testTcp', 'testTls'].forEach((k) => (o[k] = $('#' + k).checked));
   try { localStorage.setItem('turn-doctor.cfg', JSON.stringify(o)); } catch (e) {}
 }
 function loadConfig() {
   let o; try { o = JSON.parse(localStorage.getItem('turn-doctor.cfg')); } catch (e) { return; }
   if (!o) return;
   SAVE_KEYS.forEach((k) => { if (o[k] != null && $('#' + k)) $('#' + k).value = o[k]; });
-  ['testStun', 'testUdp', 'testTcp', 'testTls'].forEach((k) => { if (o[k] != null && $('#' + k)) $('#' + k).checked = o[k]; });
   if (o.authMode) setAuthMode(o.authMode);
 }
 

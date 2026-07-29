@@ -23,6 +23,16 @@ const TEST_DEFS = [
 const NAT_FALLBACK_STUN = ['stun:stun.cloudflare.com:3478', 'stun:stun1.l.google.com:19302'];
 const PROBE_TIMEOUT = 9000;
 
+// Apple's WebKit (desktop Safari and every browser on iOS/iPadOS) does not expose
+// ICE error codes on onicecandidateerror, so a credential-less TURN probe can't
+// see the 401 that proves reachability. Detect it to word the message correctly.
+const BROWSER_HIDES_ICE_ERRORS = (function () {
+  const ua = navigator.userAgent || '';
+  const isIOS = /iP(hone|ad|od)/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isDesktopSafari = /Safari/.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/.test(ua);
+  return isIOS || isDesktopSafari;
+})();
+
 /* ---------------- credential helpers ---------------- */
 async function restCredential(secret, ttl, suffix) {
   const now = Math.floor(Date.now() / 1000);
@@ -240,7 +250,10 @@ function explainTurn(key, evalRes, res) {
     return { tone: 'fail', html: `The TURN server was reachable but <b>rejected the credential</b> (401/403). The transport itself is not blocked — fix the username/password or the shared secret and TTL, then retry.` };
   }
   if (evalRes.kind === 'inconclusive') {
-    return { tone: 'warn', html: `The probe finished over ${proto} without a relay <b>and without a visible error</b>. Some browsers — notably <b>Safari</b> — hide TURN authentication errors, so reachability can't be confirmed here without credentials. Add a shared secret/credential, or re-run in Chrome or Firefox for a definitive answer.` };
+    const why = BROWSER_HIDES_ICE_ERRORS
+      ? `This browser (<b>Safari / WebKit</b>) hides TURN authentication errors`
+      : `This browser didn't surface a TURN error`;
+    return { tone: 'warn', html: `The probe finished over ${proto} without a relay <b>and without a visible error</b>. ${why}, so reachability can't be confirmed here without credentials. Add a shared secret/credential${BROWSER_HIDES_ICE_ERRORS ? ', or re-run in Chrome or Firefox,' : ''} for a definitive answer.` };
   }
   return { tone: 'fail', html: `No <code>relay</code> candidate was allocated over ${proto}${res.timedOut ? ' (timed out)' : ''}. Either this network blocks ${proto} to the TURN port, or the server is not listening on that transport. If other transports pass, the problem is network filtering on this path.` };
 }
@@ -299,8 +312,11 @@ function computeVerdict(results, natInfo, credProvided) {
       text = 'The server answered the allocation request (401) over ' + reached + ', which proves this network lets you reach the TURN server on those transports — they are not blocked. Relay allocation was not verified because no credentials were provided; add a shared secret or credential to confirm a working relay.';
     } else if (anyInconclusive) {
       status = 'warn';
-      title = 'Reachability inconclusive in this browser';
-      text = 'The TURN probes finished without a relay and without a visible error. Safari hides TURN authentication errors, so reachability cannot be confirmed here without credentials. Add a shared secret or credential (a real relay allocation is visible in every browser), or re-run in Chrome or Firefox for a definitive result.';
+      title = BROWSER_HIDES_ICE_ERRORS ? 'Reachability inconclusive in Safari' : 'Reachability inconclusive in this browser';
+      text = (BROWSER_HIDES_ICE_ERRORS
+        ? 'The TURN probes finished without a relay and without a visible error. Safari (and every browser on iOS/iPadOS, which all use WebKit) hides TURN authentication errors, so reachability cannot be confirmed here without credentials. '
+        : 'The TURN probes finished without a relay and without a visible error, so reachability is inconclusive in this browser. ')
+        + 'Add a shared secret or credential — a real relay allocation is visible in every browser' + (BROWSER_HIDES_ICE_ERRORS ? ', or re-run in Chrome or Firefox' : '') + ' for a definitive result.';
     } else {
       status = 'fail';
       title = 'TURN is unreachable on every tested transport';

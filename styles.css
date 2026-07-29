@@ -135,6 +135,11 @@ body > *:not(.bg-grid):not(.bg-glow):not(.loading-overlay) { position: relative;
   margin: 0; font-family: var(--font-display); font-size: 12px; font-weight: 700;
   letter-spacing: 0.18em; text-transform: uppercase; color: var(--text);
 }
+.head-opt {
+  margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--faint);
+  background: var(--surface-3); padding: 2px 8px; border-radius: 5px; letter-spacing: 0; text-transform: none;
+}
+.auth-hint { margin-top: 0; margin-bottom: 14px; }
 .field { margin-bottom: 13px; }
 .field:last-child { margin-bottom: 0; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: end; }

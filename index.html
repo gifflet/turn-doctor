@@ -88,7 +88,9 @@
         <div class="panel-head">
           <svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg>
           <h2>Authentication</h2>
+          <span class="head-opt">optional</span>
         </div>
+        <p class="hint auth-hint"><svg class="ic ic-sm" viewBox="0 0 24 24"><use href="#i-info"/></svg><span>Leave empty to test <b>reachability only</b> — a <code>401</code> still proves the TURN server is reachable.</span></p>
         <div class="segmented" role="tablist" aria-label="Credential mode">
           <button type="button" class="seg is-active" role="tab" aria-selected="true" data-auth="secret">
             <svg class="ic" viewBox="0 0 24 24"><use href="#i-shield"/></svg> Shared secret

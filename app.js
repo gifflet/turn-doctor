@@ -37,13 +37,17 @@ async function restCredential(secret, ttl, suffix) {
 async function resolveCredential() {
   const mode = state.authMode;
   if (mode === 'direct') {
-    return { username: val('username'), password: val('password') };
+    const u = val('username'), p = val('password');
+    if (u && p) return { username: u, password: p, provided: true };
+    return { username: '.', password: '.', provided: false };
   }
+  const secret = val('sharedSecret');
+  if (!secret) return { username: '.', password: '.', provided: false };
   if (!window.crypto || !crypto.subtle) {
     throw new Error('Web Crypto is unavailable. Open this page over HTTPS to derive credentials from a shared secret, or switch to Direct credential.');
   }
-  const secret = val('sharedSecret');
-  return restCredential(secret, val('ttl'), val('suffix').trim());
+  const c = await restCredential(secret, val('ttl'), val('suffix').trim());
+  return { username: c.username, password: c.password, provided: true };
 }
 
 /* ---------------- the core ICE probe ---------------- */
@@ -131,10 +135,14 @@ async function detectNat(primarySrflx) {
 }
 
 /* ---------------- evaluation ---------------- */
-function evaluateTurn(res) {
+function evaluateTurn(res, provided) {
   if (res.gotWanted) return { status: 'pass', kind: 'ok' };
   const has = (code) => res.errors.some((e) => Number(e.errorCode) === code);
-  if (has(401) || has(403) || has(438)) return { status: 'fail', kind: 'auth' };
+  if (has(401) || has(403) || has(438)) {
+    // 401 means the packet reached the server and came back: reachable.
+    // With credentials, that is an auth failure; without, it is a reachability pass.
+    return provided ? { status: 'fail', kind: 'auth' } : { status: 'pass', kind: 'reachable' };
+  }
   if (has(701) || res.timedOut || res.candidates.length === 0) return { status: 'fail', kind: 'unreach' };
   return { status: 'fail', kind: 'unreach' };
 }
@@ -206,14 +214,17 @@ function errRows(errs) {
 
 function explainTurn(key, evalRes, res) {
   const url = turnUrl(key);
-  if (evalRes.status === 'pass') {
+  const proto = key === 'tls' ? 'TLS' : key.toUpperCase();
+  if (evalRes.kind === 'ok') {
     const relay = res.candidates.find((c) => c.type === 'relay');
     return { tone: 'pass', html: `Allocated a <code>relay</code> candidate in ${res.firstMs} ms via <code>${esc(url)}</code>${relay ? ` (relay address <b class="mono">${esc(relay.address)}:${esc(relay.port)}</b>)` : ''}. This transport reaches the TURN server from your network and can carry media.` };
+  }
+  if (evalRes.kind === 'reachable') {
+    return { tone: 'pass', html: `The TURN server is <b>reachable over ${proto}</b> — it answered the allocation request with <code>401</code>, which proves your network lets you reach it on this transport. No credentials were provided, so no relay was allocated. Add a shared secret or credential to verify a full relay allocation.` };
   }
   if (evalRes.kind === 'auth') {
     return { tone: 'fail', html: `The TURN server was reachable but <b>rejected the credential</b> (401/403). The transport itself is not blocked — fix the username/password or the shared secret and TTL, then retry.` };
   }
-  const proto = key === 'tls' ? 'TLS' : key.toUpperCase();
   return { tone: 'fail', html: `No <code>relay</code> candidate was allocated over ${proto}${res.timedOut ? ' (timed out)' : ''}. Either this network blocks ${proto} to the TURN port, or the server is not listening on that transport. If other transports pass, the problem is network filtering on this path.` };
 }
 
@@ -241,46 +252,58 @@ function fillBody(card, contentHtml) {
 }
 
 /* ---------------- verdict ---------------- */
-function computeVerdict(results, natInfo) {
-  const r = (k) => results[k];
+function computeVerdict(results, natInfo, credProvided) {
   const ran = (k) => results[k] && results[k].ran;
-  const ok = (k) => results[k] && results[k].eval && results[k].eval.status === 'pass';
+  const relayOk = (k) => results[k] && results[k].eval && results[k].eval.kind === 'ok';
+  const reachOk = (k) => results[k] && results[k].eval && results[k].eval.status === 'pass';
   const authFail = ['udp', 'tcp', 'tls'].some((k) => ran(k) && results[k].eval.kind === 'auth');
   const anyTurnRan = ['udp', 'tcp', 'tls'].some(ran);
-  const anyTurnOk = ['udp', 'tcp', 'tls'].some(ok);
+  const anyRelayOk = ['udp', 'tcp', 'tls'].some(relayOk);
+  const anyReachOk = ['udp', 'tcp', 'tls'].some(reachOk);
 
   const chips = [];
-  chips.push(chip('STUN', ran('stun') ? (ok('stun') ? 'pass' : 'fail') : 'skip'));
-  ['udp', 'tcp', 'tls'].forEach((k) => chips.push(chip('TURN/' + k.toUpperCase(), ran(k) ? (ok(k) ? 'pass' : 'fail') : 'skip')));
+  chips.push(chip('STUN', ran('stun') ? (reachOk('stun') ? 'pass' : 'fail') : 'skip'));
+  ['udp', 'tcp', 'tls'].forEach((k) => chips.push(chip('TURN/' + k.toUpperCase(), ran(k) ? (reachOk(k) ? 'pass' : 'fail') : 'skip')));
   if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
 
   let status, title, text;
 
-  if (anyTurnRan && !anyTurnOk && authFail) {
+  if (anyTurnRan && !credProvided) {
+    if (anyReachOk) {
+      const reached = ['udp', 'tcp', 'tls'].filter(reachOk).map((k) => k.toUpperCase()).join(', ');
+      status = 'pass';
+      title = 'TURN is reachable — credentials not tested';
+      text = 'The server answered the allocation request (401) over ' + reached + ', which proves this network lets you reach the TURN server on those transports — they are not blocked. Relay allocation was not verified because no credentials were provided; add a shared secret or credential to confirm a working relay.';
+    } else {
+      status = 'fail';
+      title = 'TURN is unreachable on every tested transport';
+      text = 'No response over the tested transports (timeouts). Likely causes: wrong host/ports, the server is down, or this network blocks all of them. Confirm the host resolves publicly and the coturn ports are open.';
+    }
+  } else if (anyTurnRan && !anyRelayOk && authFail) {
     status = 'fail';
     title = 'TURN credential rejected';
     text = 'The server answered but refused authentication (401/403) on every tested transport. The network path is fine — fix the credential (direct username/password, or the shared secret + TTL + suffix) and run again.';
-  } else if (anyTurnRan && !anyTurnOk) {
+  } else if (anyTurnRan && !anyRelayOk) {
     status = 'fail';
     title = 'TURN is unreachable on every tested transport';
-    text = 'No relay could be allocated over UDP, TCP or TLS. Likely causes: the TURN host/ports are wrong, the server is down, or this network blocks all of them. Confirm the host resolves publicly and the coturn relay port range is open.';
-  } else if (ok('udp')) {
+    text = 'No relay could be allocated over the tested transports. Likely causes: the TURN host/ports are wrong, the server is down, or this network blocks all of them. Confirm the host resolves publicly and the coturn relay port range is open.';
+  } else if (relayOk('udp')) {
     status = 'pass';
     title = 'TURN relay is healthy over UDP';
     text = 'This network reaches the TURN server and allocates a UDP relay. If clients still drop intermittently, the cause is ICE selection (the browser prefers host/srflx first) — force iceTransportPolicy: relay, or investigate ICE timing. It is not a reachability problem here.';
-  } else if (!ok('udp') && ok('tcp')) {
+  } else if (relayOk('tcp')) {
     status = 'warn';
     title = 'This network blocks UDP — TURN works over TCP';
     text = 'The UDP relay failed but TCP succeeded, so your network filters UDP to the TURN port. Make sure the client offers turn:...?transport=tcp (and the coturn allows TCP). TLS/443 is the most firewall-proof upgrade if you also hit DPI.';
-  } else if (!ok('udp') && !ok('tcp') && ok('tls')) {
+  } else if (relayOk('tls')) {
     status = 'warn';
     title = 'Only TLS gets through — likely deep packet inspection';
     text = 'UDP and plain TCP were blocked, but TURN over TLS succeeded. This is typical of restrictive/corporate networks. Serve TURNS on 443 and advertise turns:...:5349 (or :443) to clients so relay survives DPI.';
-  } else if (ran('stun') && ok('stun')) {
+  } else if (ran('stun') && reachOk('stun')) {
     status = 'warn';
     title = 'STUN works, TURN was not confirmed';
-    text = 'A public mapping was found via STUN, but no TURN transport was verified (none enabled or all failed). Enable the TURN probes with valid credentials to confirm relay reachability.';
+    text = 'A public mapping was found via STUN, but no TURN transport was verified (none enabled or all failed). Enable the TURN probes to confirm relay reachability.';
   } else {
     status = 'fail';
     title = 'No connectivity established';
@@ -344,8 +367,6 @@ function readConfig() {
 function validate() {
   const bad = [];
   if (!state.host) bad.push('turnHost');
-  if (state.authMode === 'secret' && !val('sharedSecret')) bad.push('sharedSecret');
-  if (state.authMode === 'direct' && (!val('username') || !val('password'))) bad.push(val('username') ? 'password' : 'username');
   bad.forEach((id) => {
     const el = $('#' + id);
     el.style.borderColor = 'var(--fail)';
@@ -373,9 +394,9 @@ async function run() {
 
   let cred;
   try {
-    diagLog(state.authMode === 'secret' ? 'Deriving REST credential (HMAC-SHA1) from shared secret' : 'Using direct credential', 'dim');
     cred = await resolveCredential();
-    diagLog('Credential ready — username ' + (cred.username || '(none)'), 'ok');
+    if (cred.provided) diagLog('Credential ready — username ' + cred.username, 'ok');
+    else diagLog('No credentials provided — testing TURN reachability only (a 401 still proves the server is reachable)', 'dim');
   } catch (e) {
     splashHide();
     state.running = false;
@@ -423,17 +444,19 @@ async function run() {
       evalRes = { status: srflx ? 'pass' : 'warn', kind: srflx ? 'ok' : 'nostun' };
       explain = explainStun(evalRes, res, natInfo);
     } else {
-      diagLog(d.name + ' — allocating relay via ' + turnUrl(d.key), 'run');
+      diagLog(d.name + (cred.provided ? ' — allocating relay via ' : ' — probing reachability via ') + turnUrl(d.key), 'run');
       const iceServers = [{ urls: turnUrl(d.key), username: cred.username, credential: cred.password }];
       res = await probe({ iceServers, policy: 'relay', want: 'relay' });
-      evalRes = evaluateTurn(res);
-      if (evalRes.status === 'pass') {
+      evalRes = evaluateTurn(res, cred.provided);
+      if (evalRes.kind === 'ok') {
         const relay = res.candidates.find((c) => c.type === 'relay');
         diagLog(d.name + ' — relay ' + (relay ? relay.address + ':' + relay.port : 'allocated') + ' (' + res.firstMs + ' ms)', 'ok');
+      } else if (evalRes.kind === 'reachable') {
+        diagLog(d.name + ' — reachable (401 — no credentials provided)', 'ok');
       } else if (evalRes.kind === 'auth') {
         diagLog(d.name + ' — credential rejected (401/403)', 'no');
       } else {
-        diagLog(d.name + ' — no relay allocated' + (res.timedOut ? ' (timed out)' : ''), 'no');
+        diagLog(d.name + ' — no response' + (res.timedOut ? ' (timed out)' : ''), 'no');
       }
       explain = explainTurn(d.key, evalRes, res);
     }
@@ -445,7 +468,7 @@ async function run() {
     done++;
     splashProgress(done, defs.length);
 
-    const credLine = (d.key !== 'stun' && (cred.username || cred.password)) ? `
+    const credLine = (d.key !== 'stun' && cred.provided) ? `
       <p class="data-title">Credential used</p>
       <div style="margin-bottom:14px">
         <button class="copy-btn" data-copy="${esc(cred.username)}"><svg class="ic" viewBox="0 0 24 24"><use href="#i-copy"/></svg><span>username</span></button>
@@ -463,7 +486,7 @@ async function run() {
 
   splashCurrent('Computing verdict');
   diagLog('All probes complete — computing verdict', 'run');
-  computeVerdict(results, natInfo);
+  computeVerdict(results, natInfo, cred.provided);
   diagLog('Done', 'ok');
 
   await new Promise((r) => setTimeout(r, 600));

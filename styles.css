@@ -363,6 +363,8 @@ input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin
   background: var(--fail-dim); border: 1px solid rgba(240,84,79,0.25); margin-bottom: 6px;
 }
 .err-code { color: var(--fail); font-weight: 600; flex: none; }
+.err-line.err-benign { background: var(--warn-dim); border-color: rgba(230,181,74,0.25); }
+.err-line.err-benign .err-code { color: var(--warn); }
 
 .copy-btn {
   display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px;

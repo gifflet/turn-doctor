@@ -196,15 +196,26 @@ function candRows(cands) {
     </tr>`).join('');
 }
 
-function errRows(errs) {
-  const meaningful = errs.filter((e) => e.errorCode || e.errorText);
+function errRows(errs, passed) {
+  let meaningful = errs.filter((e) => e.errorCode || e.errorText);
+  // On a successful probe, a 401 is just the reachability signal (already shown
+  // in the explanation) and a 701 means one host interface (e.g. a VPN or a
+  // virtual NIC) couldn't reach the server while another one did. Show only the
+  // 701s, framed as a benign note, deduplicated per server URL.
+  if (passed) {
+    const seen = {};
+    meaningful = meaningful.filter((e) => Number(e.errorCode) === 701 && !seen[e.url || '701'] && (seen[e.url || '701'] = 1));
+    if (!meaningful.length) return '';
+    return '<p class="data-title">Notes</p>' + meaningful.map((e) => `
+      <div class="err-line err-benign"><span class="err-code">701</span><span>A host interface could not reach the server — harmless, another interface succeeded (common with VPNs or multiple network interfaces)${e.url ? ' · ' + esc(e.url) : ''}</span></div>`).join('');
+  }
   if (!meaningful.length) return '';
   const label = (e) => {
     const c = Number(e.errorCode);
     if (c === 401) return 'Unauthorized — credential rejected';
     if (c === 403) return 'Forbidden — peer/permission denied';
     if (c === 438) return 'Stale nonce';
-    if (c === 701) return 'Server not reachable (STUN/TURN allocate failed)';
+    if (c === 701) return 'Could not reach the server — no host interface got a response';
     if (c === 300) return 'Try alternate server';
     return e.errorText || 'ICE error';
   };
@@ -480,7 +491,7 @@ async function run() {
       <p class="data-title">ICE candidates (${res.candidates.length})</p>
       <table class="cand-table"><thead><tr><th>Type</th><th>Proto</th><th>Address</th><th>Port</th></tr></thead>
       <tbody>${candRows(res.candidates)}</tbody></table>
-      ${errRows(res.errors)}
+      ${errRows(res.errors, evalRes.status === 'pass')}
       ${credLine}`);
   }
 

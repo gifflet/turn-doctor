@@ -17,8 +17,8 @@ const TEST_DEFS = [
   { key: 'stun', name: 'STUN reachability & NAT', want: 'srflx' },
   { key: 'udp', name: 'TURN over UDP', want: 'relay' },
   { key: 'tcp', name: 'TURN over TCP', want: 'relay' },
-  { key: 'tls', name: 'TURN over TLS', want: 'relay' },
   { key: 'flow', name: 'TURN relay data flow', want: 'data' },
+  { key: 'tls', name: 'TURN over TLS', want: 'relay' }, // last: off by default, often slow/timeouts
 ];
 
 const NAT_FALLBACK_STUN = ['stun:stun.cloudflare.com:3478', 'stun:stun1.l.google.com:19302'];
@@ -144,6 +144,8 @@ function relayFlowProbe({ iceServers, timeout = 12000 }) {
       b = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
     } catch (e) {
       res.errors.push({ errorText: 'PeerConnection init failed: ' + e.message });
+      try { a && a.close(); } catch (_) {}
+      try { b && b.close(); } catch (_) {}
       resolve(res);
       return;
     }
@@ -202,12 +204,14 @@ function relayFlowProbe({ iceServers, timeout = 12000 }) {
 
 function evaluateFlow(res) {
   if (res.dataOk) return { status: 'pass', kind: 'flow' };
+  // ICE connected but the echo never came back — timing/MTU on the relay path.
+  // Checked before the relay-address heuristic so a captured-late relay candidate
+  // can't misclassify a connection that actually came up.
+  if (res.connected) return { status: 'warn', kind: 'partial' };
   const authErr = res.errors.some((e) => { const c = Number(e.errorCode); return c === 401 || c === 403; });
-  if (res.aRelay && res.bRelay) {
-    // Both allocations succeeded (relay addresses handed out) but no byte crossed:
-    // the relay port path is broken (firewall on the port range, or peer ACL).
-    return res.connected ? { status: 'warn', kind: 'partial' } : { status: 'fail', kind: 'noflow' };
-  }
+  // Both peers got a relay address but never connected: the relay port path is
+  // broken (firewall on the port range, or peer ACL denies the peer).
+  if (res.aRelay && res.bRelay) return { status: 'fail', kind: 'noflow' };
   if (authErr) return { status: 'fail', kind: 'auth' };
   return { status: 'fail', kind: 'noalloc' };
 }
@@ -225,7 +229,7 @@ function explainFlow(evalRes, res) {
   if (evalRes.kind === 'auth') {
     return { tone: 'fail', html: `The relay couldn't be allocated for the data-flow test because the <b>credential was rejected</b> (401/403). Fix the shared secret / TTL / username-password, then re-run.` };
   }
-  return { tone: 'fail', html: `No relay could be allocated for the data-flow test${res.timedOut ? ' (timed out)' : ''}. If the per-transport probes passed but this didn't, the server minted an allocation address but the relay itself isn't usable from here.` };
+  return { tone: 'fail', html: `Couldn't establish a working relay pair for the data-flow test${res.timedOut ? ' (timed out)' : ''}. If the per-transport probes passed but this didn't, the server hands out allocation addresses but a usable relay path couldn't be set up from here.` };
 }
 
 /* ---------------- per-transport url builders ---------------- */
@@ -414,14 +418,18 @@ function computeVerdict(results, natInfo, credProvided) {
   const flowRan = ran('flow');
   const flowEval = flowRan ? results.flow.eval : null;
 
-  const chips = [];
-  chips.push(chip('STUN', ran('stun') ? (reachOk('stun') ? 'pass' : 'fail') : 'skip'));
-  ['udp', 'tcp', 'tls'].forEach((k) => {
+  // Chip order mirrors the probe order: STUN, UDP, TCP, data flow, then TLS last.
+  const turnChip = (k) => {
     let s = 'skip';
     if (ran(k)) s = reachOk(k) ? 'pass' : (results[k].eval.kind === 'inconclusive' ? 'warn' : 'fail');
-    chips.push(chip('TURN/' + k.toUpperCase(), s));
-  });
+    return chip('TURN/' + k.toUpperCase(), s);
+  };
+  const chips = [];
+  chips.push(chip('STUN', ran('stun') ? (reachOk('stun') ? 'pass' : 'fail') : 'skip'));
+  chips.push(turnChip('udp'));
+  chips.push(turnChip('tcp'));
   if (flowRan) chips.push(chip('DATA FLOW', flowEval.status === 'pass' ? 'pass' : flowEval.status === 'warn' ? 'warn' : 'fail'));
+  chips.push(turnChip('tls'));
   if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
 
@@ -433,7 +441,13 @@ function computeVerdict(results, natInfo, credProvided) {
   if (flowRan && flowEval.kind === 'flow') {
     status = 'pass';
     title = 'TURN relay verified end to end';
-    text = 'Data actually traversed the relay — two peers were forced to relay-only and a DataChannel echoed through it. Allocation, permissions and the relay port path all work. If specific clients still fail, the cause is their local network/NAT, not this server.';
+    // The flow test can ride whichever transport succeeded, so surface any
+    // individual transport that failed instead of hiding it behind the pass.
+    const blocked = ['udp', 'tcp', 'tls'].filter((k) => ran(k) && !reachOk(k)).map((k) => 'TURN/' + k.toUpperCase());
+    text = 'Data actually traversed the relay — two peers were forced to relay-only and a DataChannel echoed through it. Allocation, permissions and the relay port path all work.';
+    text += blocked.length
+      ? ' Note: ' + blocked.join(', ') + ' failed individually, so the relay is riding only the transport(s) that passed — fix them for redundancy, or clients limited to that transport will still fail.'
+      : ' If specific clients still fail, the cause is their local network/NAT, not this server.';
   } else if (flowRan && flowEval.kind === 'noflow') {
     status = 'fail';
     title = 'Relay allocates but carries no data';
@@ -448,8 +462,8 @@ function computeVerdict(results, natInfo, credProvided) {
     text = 'Both peers allocated a relay and ICE connected, but the DataChannel did not echo in time. This is usually a timing/MTU hiccup — re-run to confirm. If it persists, inspect the relay port range and the coturn logs.';
   } else if (flowRan && flowEval.kind === 'noalloc') {
     status = 'fail';
-    title = 'Relay could not be allocated';
-    text = 'The data-flow test could not allocate a relay with the provided credential. Confirm the credential is valid and that at least one TURN transport reaches the server, then run again.';
+    title = 'Relay path could not be established';
+    text = 'The data-flow test could not set up a working relay pair with the provided credential. Confirm the credential is valid and that at least one TURN transport reaches the server, then run again.';
   } else if (anyTurnRan && !credProvided) {
     const anyInconclusive = ['udp', 'tcp', 'tls'].some((k) => results[k] && results[k].eval && results[k].eval.kind === 'inconclusive');
     if (anyReachOk) {
@@ -527,7 +541,7 @@ function buildReport(results, natInfo, cred, verdict) {
   const v4 = srflxes.find((c) => c.address.indexOf(':') < 0);
   const v6 = srflxes.find((c) => c.address.indexOf(':') >= 0);
 
-  const probes = ['stun', 'udp', 'tcp', 'tls', 'flow'].filter((k) => results[k] && results[k].ran).map((k) => {
+  const probes = ['stun', 'udp', 'tcp', 'flow', 'tls'].filter((k) => results[k] && results[k].ran).map((k) => {
     const R = results[k], ev = R.eval, res = R.res;
     let detail;
     if (k === 'stun') {
@@ -708,6 +722,8 @@ async function run() {
   };
   if (enabled.flow && !cred.provided) {
     diagLog('Relay data-flow — skipped (needs a credential to allocate a relay and push bytes through it)', 'warn');
+  } else if (enabled.flow && cred.provided && !(enabled.udp || enabled.tcp || enabled.tls)) {
+    diagLog('Relay data-flow — skipped (enable at least one TURN transport to carry it)', 'warn');
   }
   // The data-flow test needs a credential (no allocation without auth) and at
   // least one TURN transport enabled to carry it.

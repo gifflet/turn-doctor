@@ -292,6 +292,32 @@ input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin
 .chip[data-s="warn"] { color: var(--warn); border-color: rgba(230,181,74,0.4); background: var(--warn-dim); }
 .chip[data-s="skip"] { color: var(--faint); }
 
+/* ---------- share ---------- */
+.verdict-body { flex: 1; min-width: 0; }
+.share { flex: none; position: relative; align-self: flex-start; }
+.share-btn {
+  display: inline-flex; align-items: center; gap: 7px; font-family: var(--font-sans);
+  font-size: 12.5px; font-weight: 600; color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 8px 12px;
+  cursor: pointer; white-space: nowrap; transition: border-color .15s, background .15s;
+}
+.share-btn:hover { border-color: var(--accent-2); background: var(--surface-3); }
+.share-btn .test-caret { width: 15px; height: 15px; transition: transform .2s; }
+.share.is-open .test-caret { transform: rotate(180deg); }
+.share-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 8; min-width: 195px;
+  background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow); overflow: hidden; padding: 4px; animation: reveal .16s both;
+}
+.share-menu.is-hidden { display: none; }
+.share-menu button {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 9px 11px; background: transparent; border: none; color: var(--text);
+  font-family: var(--font-sans); font-size: 13px; cursor: pointer; border-radius: 6px;
+}
+.share-menu button:hover { background: var(--surface-3); }
+.share-menu button .ic { color: var(--muted); }
+
 /* ---------- test cards ---------- */
 .tests { display: grid; gap: 12px; }
 .test {

@@ -18,6 +18,7 @@ const TEST_DEFS = [
   { key: 'udp', name: 'TURN over UDP', want: 'relay' },
   { key: 'tcp', name: 'TURN over TCP', want: 'relay' },
   { key: 'tls', name: 'TURN over TLS', want: 'relay' },
+  { key: 'flow', name: 'TURN relay data flow', want: 'data' },
 ];
 
 const NAT_FALLBACK_STUN = ['stun:stun.cloudflare.com:3478', 'stun:stun1.l.google.com:19302'];
@@ -116,13 +117,132 @@ function probe({ iceServers, policy, want, timeout = PROBE_TIMEOUT }) {
   });
 }
 
+/* ---------------- relay data-flow probe ----------------
+   Allocating a relay candidate only proves the server answered the Allocate
+   over the control port (3478) — the relay address is minted from that reply
+   before any byte crosses the relay port range. To prove the relay actually
+   carries media, stand up two PeerConnections in this browser, force BOTH to
+   iceTransportPolicy: 'relay', wire them together, and echo a DataChannel
+   message through the relay. Bytes returning = the relay path (allocation +
+   permission + channel-bind + relay port range) genuinely works. */
+function relayFlowProbe({ iceServers, timeout = 12000 }) {
+  return new Promise((resolve) => {
+    const res = { dataOk: false, connected: false, aRelay: null, bRelay: null, errors: [], candidates: [], firstMs: null, gatherMs: null, timedOut: false };
+    const t0 = performance.now();
+    let a, b, dc, to, done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      res.gatherMs = Math.round(performance.now() - t0);
+      clearTimeout(to);
+      try { a && a.close(); } catch (e) {}
+      try { b && b.close(); } catch (e) {}
+      resolve(res);
+    };
+    try {
+      a = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
+      b = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
+    } catch (e) {
+      res.errors.push({ errorText: 'PeerConnection init failed: ' + e.message });
+      resolve(res);
+      return;
+    }
+    // Trickle candidates between the two peers, buffering until the far side has
+    // a remote description (addIceCandidate before that would be rejected).
+    const ready = { a: false, b: false };
+    const queue = { a: [], b: [] };
+    const peerFor = { a: () => b, b: () => a };
+    const flush = (side) => {
+      const dst = peerFor[side]();
+      queue[side].forEach((c) => dst.addIceCandidate(c).catch(() => {}));
+      queue[side] = [];
+    };
+    const wire = (pc, side) => {
+      pc.onicecandidate = (e) => {
+        if (!e.candidate || !e.candidate.candidate) return;
+        const c = e.candidate;
+        if (c.type === 'relay') {
+          if (side === 'a' && !res.aRelay) res.aRelay = c.address + ':' + c.port;
+          if (side === 'b' && !res.bRelay) res.bRelay = c.address + ':' + c.port;
+          res.candidates.push({ type: c.type, protocol: c.protocol, address: c.address, port: c.port });
+        }
+        if (ready[side === 'a' ? 'b' : 'a']) peerFor[side]().addIceCandidate(c).catch(() => {});
+        else queue[side].push(c);
+      };
+      pc.onicecandidateerror = (e) => { if (e.errorCode) res.errors.push({ url: e.url, errorCode: e.errorCode, errorText: e.errorText }); };
+      pc.onconnectionstatechange = () => { if (pc.connectionState === 'connected') res.connected = true; };
+    };
+    wire(a, 'a');
+    wire(b, 'b');
+
+    dc = a.createDataChannel('turndoctor-flow');
+    dc.onopen = () => { try { dc.send('ping'); } catch (e) {} };
+    dc.onmessage = (m) => { if (m.data === 'pong') { res.firstMs = Math.round(performance.now() - t0); res.dataOk = true; finish(); } };
+    b.ondatachannel = (e) => { const ch = e.channel; ch.onmessage = (m) => { if (m.data === 'ping') { try { ch.send('pong'); } catch (e2) {} } }; };
+
+    (async () => {
+      try {
+        const offer = await a.createOffer();
+        await a.setLocalDescription(offer);
+        await b.setRemoteDescription(offer);
+        ready.b = true; flush('a');
+        const answer = await b.createAnswer();
+        await b.setLocalDescription(answer);
+        await a.setRemoteDescription(answer);
+        ready.a = true; flush('b');
+      } catch (e) {
+        res.errors.push({ errorText: 'negotiation failed: ' + e.message });
+        finish();
+      }
+    })();
+
+    to = setTimeout(() => { res.timedOut = true; finish(); }, timeout);
+  });
+}
+
+function evaluateFlow(res) {
+  if (res.dataOk) return { status: 'pass', kind: 'flow' };
+  const authErr = res.errors.some((e) => { const c = Number(e.errorCode); return c === 401 || c === 403; });
+  if (res.aRelay && res.bRelay) {
+    // Both allocations succeeded (relay addresses handed out) but no byte crossed:
+    // the relay port path is broken (firewall on the port range, or peer ACL).
+    return res.connected ? { status: 'warn', kind: 'partial' } : { status: 'fail', kind: 'noflow' };
+  }
+  if (authErr) return { status: 'fail', kind: 'auth' };
+  return { status: 'fail', kind: 'noalloc' };
+}
+
+function explainFlow(evalRes, res) {
+  if (evalRes.kind === 'flow') {
+    return { tone: 'pass', html: `Data crossed the relay <b>end to end</b> in ${res.firstMs} ms. Two peers were forced to <code>iceTransportPolicy: relay</code>, both allocated a relay (<b class="mono">${esc(res.aRelay)}</b> ↔ <b class="mono">${esc(res.bRelay)}</b>), ICE connected, and a <code>DataChannel</code> echoed a message <b>through the relay</b>. This proves the relay actually carries media — not just that an allocation address was handed out.` };
+  }
+  if (evalRes.kind === 'noflow') {
+    return { tone: 'fail', html: `Both peers <b>allocated a relay</b> (<b class="mono">${esc(res.aRelay)}</b>, <b class="mono">${esc(res.bRelay)}</b>) but <b>no data crossed it</b>${res.timedOut ? ' (timed out)' : ''}. The allocation succeeds over the control port, yet media can't flow through the relay port. Classic causes: the coturn relay port range (<code>min-port</code>–<code>max-port</code>, e.g. <code>49152–65535/UDP</code>) isn't open inbound on the TURN public IP, or <code>allowed-peer-ip</code> denies the peer. <b>This is exactly the failure an allocation-only check cannot see.</b>` };
+  }
+  if (evalRes.kind === 'partial') {
+    return { tone: 'warn', html: `Both relays were allocated and ICE reported <code>connected</code>, but the <code>DataChannel</code> didn't echo in time. Likely a timing/MTU hiccup on the relay path — re-run; if it persists, inspect the relay port range and the coturn logs.` };
+  }
+  if (evalRes.kind === 'auth') {
+    return { tone: 'fail', html: `The relay couldn't be allocated for the data-flow test because the <b>credential was rejected</b> (401/403). Fix the shared secret / TTL / username-password, then re-run.` };
+  }
+  return { tone: 'fail', html: `No relay could be allocated for the data-flow test${res.timedOut ? ' (timed out)' : ''}. If the per-transport probes passed but this didn't, the server minted an allocation address but the relay itself isn't usable from here.` };
+}
+
 /* ---------------- per-transport url builders ---------------- */
 function turnUrl(key) {
   const host = state.host, port = state.port, tls = state.tlsPort;
   if (key === 'udp') return `turn:${host}:${port}?transport=udp`;
   if (key === 'tcp') return `turn:${host}:${port}?transport=tcp`;
   if (key === 'tls') return `turns:${host}:${tls}?transport=tcp`;
+  if (key === 'flow') return `relay ↔ relay · turn:${host}`;
   return state.stun;
+}
+
+// iceServers for the data-flow test: every enabled TURN transport with the
+// resolved credential, mirroring what a real client would offer.
+function flowIceServers(enabled, cred) {
+  const urls = ['udp', 'tcp', 'tls'].filter((k) => enabled[k]).map((k) => turnUrl(k));
+  return [{ urls, username: cred.username, credential: cred.password }];
 }
 
 /* ---------------- NAT detection (best effort) ---------------- */
@@ -291,6 +411,9 @@ function computeVerdict(results, natInfo, credProvided) {
   const anyRelayOk = ['udp', 'tcp', 'tls'].some(relayOk);
   const anyReachOk = ['udp', 'tcp', 'tls'].some(reachOk);
 
+  const flowRan = ran('flow');
+  const flowEval = flowRan ? results.flow.eval : null;
+
   const chips = [];
   chips.push(chip('STUN', ran('stun') ? (reachOk('stun') ? 'pass' : 'fail') : 'skip'));
   ['udp', 'tcp', 'tls'].forEach((k) => {
@@ -298,18 +421,42 @@ function computeVerdict(results, natInfo, credProvided) {
     if (ran(k)) s = reachOk(k) ? 'pass' : (results[k].eval.kind === 'inconclusive' ? 'warn' : 'fail');
     chips.push(chip('TURN/' + k.toUpperCase(), s));
   });
+  if (flowRan) chips.push(chip('DATA FLOW', flowEval.status === 'pass' ? 'pass' : flowEval.status === 'warn' ? 'warn' : 'fail'));
   if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
 
   let status, title, text;
 
-  if (anyTurnRan && !credProvided) {
+  // The data-flow test is the definitive signal: it proves (or disproves) that
+  // the relay carries media, which allocation-only reachability can't. When it
+  // ran, it dominates the verdict.
+  if (flowRan && flowEval.kind === 'flow') {
+    status = 'pass';
+    title = 'TURN relay verified end to end';
+    text = 'Data actually traversed the relay — two peers were forced to relay-only and a DataChannel echoed through it. Allocation, permissions and the relay port path all work. If specific clients still fail, the cause is their local network/NAT, not this server.';
+  } else if (flowRan && flowEval.kind === 'noflow') {
+    status = 'fail';
+    title = 'Relay allocates but carries no data';
+    text = 'The server accepted the allocation over the control port and handed out a relay address, but no media crossed the relay. The relay port range (coturn min-port–max-port, e.g. 49152–65535/UDP) is almost certainly not open inbound on the TURN public IP, or allowed-peer-ip denies the peer. Open the relay UDP port range and re-run. This is the failure a reachability/allocation check cannot see.';
+  } else if (flowRan && flowEval.kind === 'auth') {
+    status = 'fail';
+    title = 'TURN credential rejected';
+    text = 'The relay could not be allocated for the data-flow test — the server refused authentication (401/403). The network path is fine; fix the shared secret + TTL + suffix (or the direct username/password) and run again.';
+  } else if (flowRan && flowEval.kind === 'partial') {
+    status = 'warn';
+    title = 'Relay connected but data was not confirmed';
+    text = 'Both peers allocated a relay and ICE connected, but the DataChannel did not echo in time. This is usually a timing/MTU hiccup — re-run to confirm. If it persists, inspect the relay port range and the coturn logs.';
+  } else if (flowRan && flowEval.kind === 'noalloc') {
+    status = 'fail';
+    title = 'Relay could not be allocated';
+    text = 'The data-flow test could not allocate a relay with the provided credential. Confirm the credential is valid and that at least one TURN transport reaches the server, then run again.';
+  } else if (anyTurnRan && !credProvided) {
     const anyInconclusive = ['udp', 'tcp', 'tls'].some((k) => results[k] && results[k].eval && results[k].eval.kind === 'inconclusive');
     if (anyReachOk) {
       const reached = ['udp', 'tcp', 'tls'].filter(reachOk).map((k) => k.toUpperCase()).join(', ');
       status = 'pass';
       title = 'TURN is reachable — credentials not tested';
-      text = 'The server answered the allocation request (401) over ' + reached + ', which proves this network lets you reach the TURN server on those transports — they are not blocked. Relay allocation was not verified because no credentials were provided; add a shared secret or credential to confirm a working relay.';
+      text = 'The server answered the allocation request (401) over ' + reached + ', which proves this network lets you reach the TURN server on those transports — they are not blocked. The relay itself was not exercised because no credentials were provided. Add a shared secret or credential to run the data-flow test, which pushes bytes through the relay and catches a blocked relay port range that reachability alone cannot.';
     } else if (anyInconclusive) {
       status = 'warn';
       title = BROWSER_HIDES_ICE_ERRORS ? 'Reachability inconclusive in Safari' : 'Reachability inconclusive in this browser';
@@ -371,21 +518,27 @@ function chip(label, s) {
 let lastRun = null;
 
 function buildReport(results, natInfo, cred, verdict) {
-  const PROBE_LABEL = { stun: 'STUN reachability & NAT', udp: 'TURN over UDP', tcp: 'TURN over TCP', tls: 'TURN over TLS' };
-  const resultWord = (ev) => ev.kind === 'ok' ? 'pass (relay)' : ev.kind === 'reachable' ? 'pass (reachable)'
-    : ev.kind === 'inconclusive' ? 'inconclusive' : ev.kind === 'auth' ? 'fail (401)'
+  const PROBE_LABEL = { stun: 'STUN reachability & NAT', udp: 'TURN over UDP', tcp: 'TURN over TCP', tls: 'TURN over TLS', flow: 'TURN relay data flow' };
+  const resultWord = (ev) => ev.kind === 'ok' ? 'pass (relay)' : ev.kind === 'flow' ? 'pass (data)' : ev.kind === 'reachable' ? 'pass (reachable)'
+    : ev.kind === 'noflow' ? 'fail (no data)' : ev.kind === 'inconclusive' ? 'inconclusive' : ev.kind === 'auth' ? 'fail (401)'
     : ev.status === 'pass' ? 'pass' : ev.status === 'warn' ? 'warn' : 'fail';
   const stunRes = results.stun && results.stun.res;
   const srflxes = stunRes ? stunRes.candidates.filter((c) => c.type === 'srflx' && c.address) : [];
   const v4 = srflxes.find((c) => c.address.indexOf(':') < 0);
   const v6 = srflxes.find((c) => c.address.indexOf(':') >= 0);
 
-  const probes = ['stun', 'udp', 'tcp', 'tls'].filter((k) => results[k] && results[k].ran).map((k) => {
+  const probes = ['stun', 'udp', 'tcp', 'tls', 'flow'].filter((k) => results[k] && results[k].ran).map((k) => {
     const R = results[k], ev = R.eval, res = R.res;
     let detail;
     if (k === 'stun') {
       const s = res.candidates.find((c) => c.type === 'srflx');
       detail = s ? 'public ' + s.address + ':' + s.port : 'no srflx candidate';
+    } else if (k === 'flow') {
+      if (ev.kind === 'flow') detail = 'data echoed through relay ' + res.aRelay + ' ↔ ' + res.bRelay + ' (' + res.firstMs + ' ms)';
+      else if (ev.kind === 'noflow') detail = 'relay allocated (' + res.aRelay + ', ' + res.bRelay + ') but no data traversed';
+      else if (ev.kind === 'partial') detail = 'connected but DataChannel did not echo';
+      else if (ev.kind === 'auth') detail = 'credential rejected (401/403)';
+      else detail = res.timedOut ? 'no relay / timed out' : 'no relay allocated';
     } else if (ev.kind === 'ok') {
       const relay = res.candidates.find((c) => c.type === 'relay');
       detail = relay ? 'relay ' + relay.address + ':' + relay.port : 'relay allocated';
@@ -551,8 +704,17 @@ async function run() {
     udp: $('#testUdp').checked,
     tcp: $('#testTcp').checked,
     tls: $('#testTls').checked,
+    flow: $('#testFlow').checked,
   };
-  const defs = TEST_DEFS.filter((d) => enabled[d.key]).map((d) => ({ ...d, url: turnUrl(d.key) }));
+  if (enabled.flow && !cred.provided) {
+    diagLog('Relay data-flow — skipped (needs a credential to allocate a relay and push bytes through it)', 'warn');
+  }
+  // The data-flow test needs a credential (no allocation without auth) and at
+  // least one TURN transport enabled to carry it.
+  const defs = TEST_DEFS.filter((d) => {
+    if (d.key === 'flow') return enabled.flow && cred.provided && (enabled.udp || enabled.tcp || enabled.tls);
+    return enabled[d.key];
+  }).map((d) => ({ ...d, url: turnUrl(d.key) }));
   renderCards(defs);
   splashProgress(0, defs.length);
 
@@ -582,6 +744,22 @@ async function run() {
       }
       evalRes = { status: srflx ? 'pass' : 'warn', kind: srflx ? 'ok' : 'nostun' };
       explain = explainStun(evalRes, res, natInfo);
+    } else if (d.key === 'flow') {
+      diagLog('Relay data-flow — forcing two peers through the relay and echoing a DataChannel', 'run');
+      res = await relayFlowProbe({ iceServers: flowIceServers(enabled, cred) });
+      evalRes = evaluateFlow(res);
+      if (evalRes.kind === 'flow') {
+        diagLog('Relay data-flow — bytes crossed the relay ' + res.aRelay + ' ↔ ' + res.bRelay + ' (' + res.firstMs + ' ms)', 'ok');
+      } else if (evalRes.kind === 'noflow') {
+        diagLog('Relay data-flow — relay allocated but NO data crossed (relay port range / peer ACL blocked)', 'no');
+      } else if (evalRes.kind === 'partial') {
+        diagLog('Relay data-flow — connected but DataChannel did not echo in time', 'warn');
+      } else if (evalRes.kind === 'auth') {
+        diagLog('Relay data-flow — credential rejected (401/403)', 'no');
+      } else {
+        diagLog('Relay data-flow — no relay allocated' + (res.timedOut ? ' (timed out)' : ''), 'no');
+      }
+      explain = explainFlow(evalRes, res);
     } else {
       diagLog(d.name + (cred.provided ? ' — allocating relay via ' : ' — probing reachability via ') + turnUrl(d.key), 'run');
       const iceServers = [{ urls: turnUrl(d.key), username: cred.username, credential: cred.password }];
@@ -663,7 +841,7 @@ function hasAdvancedValues() {
     || filled('sharedSecret') || filled('username') || filled('password')
     || filled('suffix') || filled('reference')
     || state.authMode === 'direct'
-    || !$('#testStun').checked || !$('#testUdp').checked || !$('#testTcp').checked || $('#testTls').checked;
+    || !$('#testStun').checked || !$('#testUdp').checked || !$('#testTcp').checked || $('#testTls').checked || !$('#testFlow').checked;
 }
 
 /* ---------------- UI wiring ---------------- */

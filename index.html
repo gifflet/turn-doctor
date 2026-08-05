@@ -122,9 +122,29 @@
           <label class="check"><input type="checkbox" id="testStun" checked /><span class="box"></span> STUN reachability &amp; NAT</label>
           <label class="check"><input type="checkbox" id="testUdp" checked /><span class="box"></span> TURN over UDP</label>
           <label class="check"><input type="checkbox" id="testTcp" checked /><span class="box"></span> TURN over TCP</label>
-          <label class="check"><input type="checkbox" id="testFlow" checked /><span class="box"></span> Relay data flow <span class="muted-tag">needs credential</span></label>
+          <label class="check"><input type="checkbox" id="testFlow" checked /><span class="box"></span> Relay data flow <span class="muted-tag">per transport</span></label>
           <label class="check"><input type="checkbox" id="testTls" /><span class="box"></span> TURN over TLS</label>
         </div>
+
+        <p class="checks-title">Relay quality <span class="muted-tag">needs credential</span></p>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="testLoss" checked /><span class="box"></span> Packet loss &amp; jitter</label>
+          <label class="check"><input type="checkbox" id="testMtu" checked /><span class="box"></span> Payload size (MTU)</label>
+          <label class="check"><input type="checkbox" id="testSoak" /><span class="box"></span> Soak — sustained flow <span class="muted-tag">slow</span></label>
+          <label class="check"><input type="checkbox" id="testGaps" /><span class="box"></span> Lifetime &amp; silence gaps <span class="muted-tag">slow</span></label>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="soakSeconds">Soak duration <span class="muted-tag">seconds</span></label>
+            <input id="soakSeconds" type="number" min="5" max="900" value="60" />
+          </div>
+          <div class="field">
+            <label for="gapMarks">Silence gaps <span class="muted-tag">seconds</span></label>
+            <input id="gapMarks" type="text" spellcheck="false" value="30,60,120" placeholder="30,60,120" />
+          </div>
+        </div>
+        <p class="hint"><svg class="ic ic-sm" viewBox="0 0 24 24"><use href="#i-clock"/></svg><span>The quality probes hold a relay open and push real bytes through it. Add <code>300,600</code> to the gaps to cross the TURN <b>permission</b> (5 min) and <b>allocation</b> (10 min) lifetimes — that run takes over 15 minutes.</span></p>
+
         <div class="field ref-field">
           <label for="reference">Reference <span class="muted-tag">optional</span></label>
           <input id="reference" type="text" spellcheck="false" placeholder="name or ticket # for the report" />

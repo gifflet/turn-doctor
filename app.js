@@ -18,11 +18,46 @@ const TEST_DEFS = [
   { key: 'udp', name: 'TURN over UDP', want: 'relay' },
   { key: 'tcp', name: 'TURN over TCP', want: 'relay' },
   { key: 'flow', name: 'TURN relay data flow', want: 'data' },
-  { key: 'tls', name: 'TURN over TLS', want: 'relay' }, // last: off by default, often slow/timeouts
+  { key: 'tls', name: 'TURN over TLS', want: 'relay' }, // off by default, often slow/timeouts
+  { key: 'loss', name: 'Relay packet loss & jitter', want: 'data' },
+  { key: 'mtu', name: 'Relay payload size (MTU)', want: 'data' },
+  { key: 'soak', name: 'Relay soak — sustained flow', want: 'data' },
+  { key: 'gaps', name: 'TURN lifetime & silence gaps', want: 'data' },
 ];
+
+// Probes that stand up a relay↔relay pair and push bytes through it. They all
+// need a credential (no allocation without auth) and at least one transport.
+const DATA_PROBES = ['flow', 'loss', 'mtu', 'soak', 'gaps'];
+const FLOW_TRANSPORTS = ['udp', 'tcp', 'tls'];
 
 const NAT_FALLBACK_STUN = ['stun:stun.cloudflare.com:3478', 'stun:stun1.l.google.com:19302'];
 const PROBE_TIMEOUT = 9000;
+
+/* Loss/jitter probe: unreliable DataChannel, so a transient drop stays visible
+   instead of being repaired by SCTP retransmission the way production RTP never
+   would be. */
+const LOSS_PINGS = 40;
+const LOSS_INTERVAL = 90;
+const LOSS_DRAIN = 1500;
+
+/* A freshly opened relay is slow for the first few packets — SCTP slow start
+   plus the TURN permission being set up — with round trips an order of
+   magnitude above steady state (measured ~300 ms settling to ~13 ms). Priming
+   the path before measuring keeps that startup cost out of the jitter figure,
+   which would otherwise report a healthy relay as degraded. */
+const RELAY_WARMUP = 8;
+
+/* MTU probe: payload sizes bracketing a typical RTP video packet (~1200 B) and
+   the classic 1500 B Ethernet MTU, plus sizes past it to find the cliff. */
+const MTU_SIZES = [100, 500, 1000, 1200, 1400, 1500, 2000, 4000];
+const MTU_TIMEOUT = 2500;
+
+const DEFAULT_SOAK_SECONDS = 60;
+const SOAK_TICK = 1000;
+const DEFAULT_GAP_MARKS = '30,60,120';
+const GAP_ECHO_TIMEOUT = 6000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Apple's WebKit (desktop Safari and every browser on iOS/iPadOS) does not expose
 // ICE error codes on onicecandidateerror, so a credential-less TURN probe can't
@@ -117,36 +152,45 @@ function probe({ iceServers, policy, want, timeout = PROBE_TIMEOUT }) {
   });
 }
 
-/* ---------------- relay data-flow probe ----------------
+/* ---------------- relay pair setup ----------------
    Allocating a relay candidate only proves the server answered the Allocate
    over the control port (3478) — the relay address is minted from that reply
    before any byte crosses the relay port range. To prove the relay actually
    carries media, stand up two PeerConnections in this browser, force BOTH to
-   iceTransportPolicy: 'relay', wire them together, and echo a DataChannel
-   message through the relay. Bytes returning = the relay path (allocation +
-   permission + channel-bind + relay port range) genuinely works. */
-function relayFlowProbe({ iceServers, timeout = 12000 }) {
+   iceTransportPolicy: 'relay', wire them together, and push bytes through.
+
+   This helper only *establishes* the pair and hands it back OPEN, so the flow,
+   loss, MTU, soak and gap probes all drive the same setup instead of each one
+   duplicating the negotiation dance. The caller owns closing it via
+   closeRelayPair(). Side B echoes whatever it receives, so every probe can just
+   send and measure the round trip. */
+function establishRelayPair({ iceServers, timeout = 12000, label = 'turndoctor', dcOptions = null }) {
   return new Promise((resolve) => {
-    const res = { dataOk: false, connected: false, aRelay: null, bRelay: null, errors: [], candidates: [], firstMs: null, gatherMs: null, timedOut: false };
+    const out = {
+      ok: false, a: null, b: null, dc: null, connected: false,
+      aRelay: null, bRelay: null, errors: [], candidates: [],
+      openMs: null, timedOut: false,
+    };
     const t0 = performance.now();
     let a, b, dc, to, done = false;
-    const finish = () => {
+    const settle = (ok) => {
       if (done) return;
       done = true;
-      res.gatherMs = Math.round(performance.now() - t0);
       clearTimeout(to);
-      try { a && a.close(); } catch (e) {}
-      try { b && b.close(); } catch (e) {}
-      resolve(res);
+      out.ok = ok;
+      out.openMs = Math.round(performance.now() - t0);
+      out.a = a; out.b = b; out.dc = dc;
+      if (!ok) closeRelayPair(out);
+      resolve(out);
     };
     try {
       a = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
       b = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
     } catch (e) {
-      res.errors.push({ errorText: 'PeerConnection init failed: ' + e.message });
+      out.errors.push({ errorText: 'PeerConnection init failed: ' + e.message });
       try { a && a.close(); } catch (_) {}
       try { b && b.close(); } catch (_) {}
-      resolve(res);
+      resolve(out);
       return;
     }
     // Trickle candidates between the two peers, buffering until the far side has
@@ -164,23 +208,29 @@ function relayFlowProbe({ iceServers, timeout = 12000 }) {
         if (!e.candidate || !e.candidate.candidate) return;
         const c = e.candidate;
         if (c.type === 'relay') {
-          if (side === 'a' && !res.aRelay) res.aRelay = c.address + ':' + c.port;
-          if (side === 'b' && !res.bRelay) res.bRelay = c.address + ':' + c.port;
-          res.candidates.push({ type: c.type, protocol: c.protocol, address: c.address, port: c.port });
+          if (side === 'a' && !out.aRelay) out.aRelay = c.address + ':' + c.port;
+          if (side === 'b' && !out.bRelay) out.bRelay = c.address + ':' + c.port;
+          out.candidates.push({ type: c.type, protocol: c.protocol, address: c.address, port: c.port });
         }
         if (ready[side === 'a' ? 'b' : 'a']) peerFor[side]().addIceCandidate(c).catch(() => {});
         else queue[side].push(c);
       };
-      pc.onicecandidateerror = (e) => { if (e.errorCode) res.errors.push({ url: e.url, errorCode: e.errorCode, errorText: e.errorText }); };
-      pc.onconnectionstatechange = () => { if (pc.connectionState === 'connected') res.connected = true; };
+      pc.onicecandidateerror = (e) => { if (e.errorCode) out.errors.push({ url: e.url, errorCode: e.errorCode, errorText: e.errorText }); };
+      pc.onconnectionstatechange = () => { if (pc.connectionState === 'connected') out.connected = true; };
     };
     wire(a, 'a');
     wire(b, 'b');
 
-    dc = a.createDataChannel('turndoctor-flow');
-    dc.onopen = () => { try { dc.send('ping'); } catch (e) {} };
-    dc.onmessage = (m) => { if (m.data === 'pong') { res.firstMs = Math.round(performance.now() - t0); res.dataOk = true; finish(); } };
-    b.ondatachannel = (e) => { const ch = e.channel; ch.onmessage = (m) => { if (m.data === 'ping') { try { ch.send('pong'); } catch (e2) {} } }; };
+    dc = dcOptions ? a.createDataChannel(label, dcOptions) : a.createDataChannel(label);
+    dc.binaryType = 'arraybuffer';
+    dc.onopen = () => settle(true);
+    // Plain echo: bounce every payload back untouched so the caller decides what
+    // the message means (ping, sequence number, size sample…).
+    b.ondatachannel = (e) => {
+      const ch = e.channel;
+      ch.binaryType = 'arraybuffer';
+      ch.onmessage = (m) => { try { ch.send(m.data); } catch (e2) {} };
+    };
 
     (async () => {
       try {
@@ -193,43 +243,508 @@ function relayFlowProbe({ iceServers, timeout = 12000 }) {
         await a.setRemoteDescription(answer);
         ready.a = true; flush('b');
       } catch (e) {
-        res.errors.push({ errorText: 'negotiation failed: ' + e.message });
-        finish();
+        out.errors.push({ errorText: 'negotiation failed: ' + e.message });
+        settle(false);
       }
     })();
 
-    to = setTimeout(() => { res.timedOut = true; finish(); }, timeout);
+    to = setTimeout(() => { out.timedOut = true; settle(false); }, timeout);
   });
 }
 
+function closeRelayPair(pair) {
+  if (!pair) return;
+  try { pair.dc && pair.dc.close(); } catch (e) {}
+  try { pair.a && pair.a.close(); } catch (e) {}
+  try { pair.b && pair.b.close(); } catch (e) {}
+}
+
+/* Which path did ICE actually pick? relayProtocol on the local candidate is how
+   the browser reaches the TURN server (udp/tcp/tls) — the answer to "was my
+   TURNS/443 really exercised, or did UDP win again?". */
+async function selectedPathStats(pc) {
+  if (!pc) return null;
+  let stats;
+  try { stats = await pc.getStats(); } catch (e) { return null; }
+  let pair = null;
+  stats.forEach((r) => {
+    if (r.type !== 'candidate-pair') return;
+    if (r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+    else if (!pair && r.state === 'succeeded') pair = r;
+  });
+  if (!pair) return null;
+  const local = stats.get ? stats.get(pair.localCandidateId) : null;
+  return {
+    bytesSent: pair.bytesSent || 0,
+    bytesReceived: pair.bytesReceived || 0,
+    rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+    requestsSent: pair.requestsSent || 0,
+    responsesReceived: pair.responsesReceived || 0,
+    relayProtocol: local ? (local.relayProtocol || null) : null,
+    address: local ? local.address : null,
+    port: local ? local.port : null,
+  };
+}
+
+/* Drive a few serialized round trips so the relay reaches steady state before
+   anything is measured. Returns how many of them actually echoed, which doubles
+   as a cheap "is this path alive at all" signal. */
+async function warmUpRelay(dc, n = RELAY_WARMUP) {
+  let ok = 0;
+  for (let i = 0; i < n; i++) {
+    const ms = await echoOnce(dc, 'warm:' + i, 2000);
+    if (ms != null) ok++;
+  }
+  return ok;
+}
+
+/* Round-trip echo helper shared by the data probes: send `payload`, resolve with
+   the elapsed ms when the same payload comes back, or null on timeout. */
+function echoOnce(dc, payload, timeout) {
+  return new Promise((resolve) => {
+    if (!dc || dc.readyState !== 'open') { resolve(null); return; }
+    const t0 = performance.now();
+    let to;
+    const onMsg = (m) => {
+      const got = typeof m.data === 'string' ? m.data : new TextDecoder().decode(m.data);
+      if (got !== payload) return;
+      cleanup();
+      resolve(Math.round(performance.now() - t0));
+    };
+    const cleanup = () => { clearTimeout(to); dc.removeEventListener('message', onMsg); };
+    dc.addEventListener('message', onMsg);
+    to = setTimeout(() => { cleanup(); resolve(null); }, timeout);
+    try { dc.send(payload); } catch (e) { cleanup(); resolve(null); }
+  });
+}
+
+/* ---------------- probe: data flow, per transport ----------------
+   The old version handed all three URLs to one RTCPeerConnection. With both
+   peers on iceTransportPolicy: 'relay' the ICE agent still gathers relay
+   candidates from every transport, but libwebrtc's type preference orders
+   relay UDP > TCP > TLS, so the nominated pair is essentially always UDP.
+   A server with healthy UDP but a broken TCP or TLS data path reported a clean
+   "verified end to end" — a false negative on exactly the two transports that
+   matter for restrictive corporate clients. Probing one transport at a time is
+   the only way to hold each data path to account. */
+async function flowProbe({ enabled, cred }) {
+  const res = { perTransport: [], candidates: [], errors: [], firstMs: null, gatherMs: null, timedOut: false };
+  const t0 = performance.now();
+  for (const key of FLOW_TRANSPORTS) {
+    if (!enabled[key]) { res.perTransport.push({ key, ran: false }); continue; }
+    const iceServers = [{ urls: turnUrl(key), username: cred.username, credential: cred.password }];
+    const pair = await establishRelayPair({ iceServers, label: 'turndoctor-flow-' + key });
+    const row = {
+      key, ran: true, dataOk: false, connected: pair.connected,
+      aRelay: pair.aRelay, bRelay: pair.bRelay, ms: null,
+      timedOut: pair.timedOut, path: null,
+    };
+    if (pair.ok) {
+      const ms = await echoOnce(pair.dc, 'flow-' + key, 6000);
+      if (ms != null) { row.dataOk = true; row.ms = ms; }
+      row.path = await selectedPathStats(pair.a);
+      row.connected = true;
+    }
+    pair.candidates.forEach((c) => res.candidates.push({ ...c, transport: key }));
+    pair.errors.forEach((e) => res.errors.push({ ...e, transport: key }));
+    closeRelayPair(pair);
+    res.perTransport.push(row);
+    if (row.dataOk && res.firstMs == null) res.firstMs = row.ms;
+  }
+  res.gatherMs = Math.round(performance.now() - t0);
+  return res;
+}
+
+/* ---------------- probe: packet loss & jitter ----------------
+   The flow probe uses a default (reliable, ordered) DataChannel, so SCTP
+   retransmits anything the network drops — a multi-second loss window is
+   invisible there while production RTP, which has no such safety net, would
+   glitch. Here the channel is unreliable and unordered, so drops stay drops. */
+async function lossProbe({ iceServers }) {
+  const res = { ran: true, sent: 0, received: 0, lossPct: null, rtts: [], jitterMs: null,
+                minMs: null, maxMs: null, avgMs: null, path: null, aRelay: null, bRelay: null,
+                candidates: [], errors: [], firstMs: null, gatherMs: null, timedOut: false, setupFailed: false };
+  const t0 = performance.now();
+  const pair = await establishRelayPair({
+    iceServers, label: 'turndoctor-loss', dcOptions: { ordered: false, maxRetransmits: 0 },
+  });
+  res.candidates = pair.candidates; res.errors = pair.errors;
+  res.aRelay = pair.aRelay; res.bRelay = pair.bRelay; res.timedOut = pair.timedOut;
+  if (!pair.ok) { res.setupFailed = true; res.gatherMs = Math.round(performance.now() - t0); closeRelayPair(pair); return res; }
+  await warmUpRelay(pair.dc);
+
+  const seen = {};
+  const sentAt = {};
+  const onMsg = (m) => {
+    const got = typeof m.data === 'string' ? m.data : new TextDecoder().decode(m.data);
+    if (got.indexOf('seq:') !== 0 || seen[got]) return;
+    seen[got] = true;
+    const t = sentAt[got];
+    if (t != null) res.rtts.push(Math.round(performance.now() - t));
+  };
+  pair.dc.addEventListener('message', onMsg);
+
+  for (let i = 0; i < LOSS_PINGS; i++) {
+    const payload = 'seq:' + i;
+    sentAt[payload] = performance.now();
+    try { pair.dc.send(payload); res.sent++; } catch (e) {}
+    await sleep(LOSS_INTERVAL);
+  }
+  await sleep(LOSS_DRAIN); // let stragglers arrive before scoring
+  pair.dc.removeEventListener('message', onMsg);
+
+  res.received = res.rtts.length;
+  res.lossPct = res.sent ? Math.round(((res.sent - res.received) / res.sent) * 1000) / 10 : null;
+  if (res.rtts.length) {
+    res.minMs = Math.min.apply(null, res.rtts);
+    res.maxMs = Math.max.apply(null, res.rtts);
+    res.avgMs = Math.round(res.rtts.reduce((a, b) => a + b, 0) / res.rtts.length);
+    res.firstMs = res.rtts[0];
+    // RFC 3550 §A.8 smoothing, applied to round-trip variation. There is no
+    // synchronised clock between the two ends here (same browser, echoed back),
+    // so this tracks RTT jitter — a proxy for one-way jitter, not a substitute.
+    let j = 0;
+    for (let i = 1; i < res.rtts.length; i++) j += (Math.abs(res.rtts[i] - res.rtts[i - 1]) - j) / 16;
+    res.jitterMs = Math.round(j * 10) / 10;
+  }
+  res.path = await selectedPathStats(pair.a);
+  closeRelayPair(pair);
+  res.gatherMs = Math.round(performance.now() - t0);
+  return res;
+}
+
+/* ---------------- probe: payload size / MTU cliff ----------------
+   Everything the reachability probes exchange is small (STUN, ~100 B). A path
+   that forwards small control packets but silently drops ~1200 B RTP-sized ones
+   looks perfectly healthy to them and produces rp=0/rb=0 on the server. NAT 1:1
+   plus edge DNAT is exactly the topology where the effective MTU shrinks and
+   PMTUD breaks (stateful firewalls often swallow the ICMP that would fix it). */
+async function mtuProbe({ iceServers }) {
+  const res = { ran: true, samples: [], largestOk: null, firstFail: null, path: null,
+                aRelay: null, bRelay: null, candidates: [], errors: [],
+                firstMs: null, gatherMs: null, timedOut: false, setupFailed: false };
+  const t0 = performance.now();
+  const pair = await establishRelayPair({
+    iceServers, label: 'turndoctor-mtu', dcOptions: { ordered: false, maxRetransmits: 0 },
+  });
+  res.candidates = pair.candidates; res.errors = pair.errors;
+  res.aRelay = pair.aRelay; res.bRelay = pair.bRelay; res.timedOut = pair.timedOut;
+  if (!pair.ok) { res.setupFailed = true; res.gatherMs = Math.round(performance.now() - t0); closeRelayPair(pair); return res; }
+  await warmUpRelay(pair.dc);
+
+  for (const size of MTU_SIZES) {
+    // Marker keeps each payload unique so echoes can't be confused across sizes.
+    const marker = 'mtu' + size + ':';
+    const payload = marker + 'x'.repeat(Math.max(0, size - marker.length));
+    const ms = await echoOnce(pair.dc, payload, MTU_TIMEOUT);
+    res.samples.push({ size, ok: ms != null, ms });
+    if (ms != null) { res.largestOk = size; if (res.firstMs == null) res.firstMs = ms; }
+    else if (res.firstFail == null) res.firstFail = size;
+    await sleep(60);
+  }
+  res.path = await selectedPathStats(pair.a);
+  closeRelayPair(pair);
+  res.gatherMs = Math.round(performance.now() - t0);
+  return res;
+}
+
+/* ---------------- probe: soak / sustained flow ----------------
+   The incident this tool chases is intermittent — degradation in time windows.
+   A ~100 ms echo has almost no chance of landing inside one. Holding the relay
+   open for minutes and sampling getStats every second produces a timeline that
+   can be lined up against the coturn logs by timestamp. */
+async function soakProbe({ iceServers, seconds, onTick }) {
+  const res = { ran: true, seconds, ticks: [], stalls: 0, longestStallS: 0, pings: 0, pongs: 0,
+                path: null, aRelay: null, bRelay: null, candidates: [], errors: [],
+                firstMs: null, gatherMs: null, timedOut: false, setupFailed: false };
+  const t0 = performance.now();
+  const pair = await establishRelayPair({
+    iceServers, label: 'turndoctor-soak', dcOptions: { ordered: false, maxRetransmits: 0 },
+  });
+  res.candidates = pair.candidates; res.errors = pair.errors;
+  res.aRelay = pair.aRelay; res.bRelay = pair.bRelay; res.timedOut = pair.timedOut;
+  if (!pair.ok) { res.setupFailed = true; res.gatherMs = Math.round(performance.now() - t0); closeRelayPair(pair); return res; }
+  await warmUpRelay(pair.dc);
+
+  let pongs = 0;
+  const onMsg = (m) => {
+    const got = typeof m.data === 'string' ? m.data : new TextDecoder().decode(m.data);
+    if (got.indexOf('soak:') === 0) pongs++;
+  };
+  pair.dc.addEventListener('message', onMsg);
+
+  let prev = await selectedPathStats(pair.a);
+  let stallRun = 0;
+  for (let t = 1; t <= seconds; t++) {
+    const before = pongs;
+    try { pair.dc.send('soak:' + t); res.pings++; } catch (e) {}
+    await sleep(SOAK_TICK);
+    const now = await selectedPathStats(pair.a);
+    const deltaBytes = (now && prev) ? Math.max(0, now.bytesReceived - prev.bytesReceived) : 0;
+    const echoed = pongs > before;
+    if (!echoed) { res.stalls++; stallRun++; if (stallRun > res.longestStallS) res.longestStallS = stallRun; }
+    else stallRun = 0;
+    const tick = { t, bytes: deltaBytes, rttMs: now ? now.rttMs : null, echoed };
+    res.ticks.push(tick);
+    if (onTick) onTick(tick, seconds);
+    prev = now;
+  }
+  pair.dc.removeEventListener('message', onMsg);
+  res.pongs = pongs;
+  res.path = await selectedPathStats(pair.a);
+  if (res.ticks.length) { const f = res.ticks.find((k) => k.rttMs != null); res.firstMs = f ? f.rttMs : null; }
+  closeRelayPair(pair);
+  res.gatherMs = Math.round(performance.now() - t0);
+  return res;
+}
+
+/* ---------------- probe: lifetime & silence gaps ----------------
+   Where the first failure lands in time names the culprit. RFC 8656: permission
+   lifetime 5 min, channel binding and allocation 10 min. A break at 30–120 s is
+   firewall/conntrack; at ~300 s a permission expiring un-refreshed; at ~600 s
+   the allocation or channel bind. Three different fixes.
+
+   Caveat worth keeping in mind: ICE consent freshness (RFC 8445 §11) keeps
+   probing the selected pair roughly every 5 s, so the silence is never total at
+   the network layer — this bounds, rather than invalidates, the result. */
+async function gapsProbe({ iceServers, marks, onMark }) {
+  const res = { ran: true, marks: [], firstFailS: null, path: null,
+                aRelay: null, bRelay: null, candidates: [], errors: [],
+                firstMs: null, gatherMs: null, timedOut: false, setupFailed: false };
+  const t0 = performance.now();
+  const pair = await establishRelayPair({
+    iceServers, label: 'turndoctor-gaps', dcOptions: { ordered: false, maxRetransmits: 0 },
+  });
+  res.candidates = pair.candidates; res.errors = pair.errors;
+  res.aRelay = pair.aRelay; res.bRelay = pair.bRelay; res.timedOut = pair.timedOut;
+  if (!pair.ok) { res.setupFailed = true; res.gatherMs = Math.round(performance.now() - t0); closeRelayPair(pair); return res; }
+  await warmUpRelay(pair.dc);
+
+  // Baseline: the path must work before a silence can be blamed for breaking it.
+  const base = await echoOnce(pair.dc, 'gap:0', GAP_ECHO_TIMEOUT);
+  res.marks.push({ seconds: 0, ok: base != null, ms: base });
+  if (onMark) onMark(res.marks[0]);
+  res.firstMs = base;
+
+  if (base != null) {
+    for (const g of marks) {
+      if (onMark) onMark({ seconds: g, pending: true });
+      await sleep(g * 1000);
+      const ms = await echoOnce(pair.dc, 'gap:' + g, GAP_ECHO_TIMEOUT);
+      const row = { seconds: g, ok: ms != null, ms };
+      res.marks.push(row);
+      if (onMark) onMark(row);
+      if (ms == null && res.firstFailS == null) { res.firstFailS = g; break; }
+    }
+  }
+  res.path = await selectedPathStats(pair.a);
+  closeRelayPair(pair);
+  res.gatherMs = Math.round(performance.now() - t0);
+  return res;
+}
+
 function evaluateFlow(res) {
-  if (res.dataOk) return { status: 'pass', kind: 'flow' };
-  // ICE connected but the echo never came back — timing/MTU on the relay path.
-  // Checked before the relay-address heuristic so a captured-late relay candidate
-  // can't misclassify a connection that actually came up.
-  if (res.connected) return { status: 'warn', kind: 'partial' };
+  const ran = res.perTransport.filter((r) => r.ran);
+  const ok = ran.filter((r) => r.dataOk);
+  if (!ran.length) return { status: 'warn', kind: 'noalloc' };
+  if (ok.length === ran.length) return { status: 'pass', kind: 'flow' };
+  if (ok.length) return { status: 'warn', kind: 'mixed' };
+  // Nothing carried data. Distinguish "allocated but nothing crossed" (relay
+  // port range / peer ACL) from "never allocated" (auth or unreachable).
+  const anyAlloc = ran.some((r) => r.aRelay && r.bRelay);
   const authErr = res.errors.some((e) => { const c = Number(e.errorCode); return c === 401 || c === 403; });
-  // Both peers got a relay address but never connected: the relay port path is
-  // broken (firewall on the port range, or peer ACL denies the peer).
-  if (res.aRelay && res.bRelay) return { status: 'fail', kind: 'noflow' };
+  if (anyAlloc) return { status: 'fail', kind: 'noflow' };
   if (authErr) return { status: 'fail', kind: 'auth' };
   return { status: 'fail', kind: 'noalloc' };
 }
 
+const TRANSPORT_LABEL = { udp: 'UDP', tcp: 'TCP', tls: 'TLS' };
+
+function flowTable(rows) {
+  const body = rows.map((r) => {
+    if (!r.ran) return `<tr><td>${TRANSPORT_LABEL[r.key]}</td><td colspan="3" style="color:var(--faint)">not enabled</td></tr>`;
+    const via = r.path && r.path.relayProtocol ? r.path.relayProtocol : '—';
+    const verdict = r.dataOk
+      ? `<span class="ctype ctype-relay">data ok</span>`
+      : r.connected ? `<span class="ctype ctype-prflx">no echo</span>` : `<span class="ctype ctype-fail">no relay</span>`;
+    return `<tr><td>${TRANSPORT_LABEL[r.key]}</td><td>${verdict}</td><td>${r.ms != null ? r.ms + ' ms' : '—'}</td><td>${esc(via)}</td></tr>`;
+  }).join('');
+  return `<table class="cand-table"><thead><tr><th>Transport</th><th>Result</th><th>Echo</th><th>Via</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+
 function explainFlow(evalRes, res) {
+  const table = flowTable(res.perTransport);
+  const note = ` Each transport is probed <b>on its own</b> — handing all URLs to one connection lets relay UDP win the ICE priority every time, hiding a broken TCP or TLS data path behind a passing UDP one.`;
   if (evalRes.kind === 'flow') {
-    return { tone: 'pass', html: `Data crossed the relay <b>end to end</b> in ${res.firstMs} ms. Two peers were forced to <code>iceTransportPolicy: relay</code>, both allocated a relay (<b class="mono">${esc(res.aRelay)}</b> ↔ <b class="mono">${esc(res.bRelay)}</b>), ICE connected, and a <code>DataChannel</code> echoed a message <b>through the relay</b>. This proves the relay actually carries media — not just that an allocation address was handed out.` };
+    const list = res.perTransport.filter((r) => r.ran).map((r) => TRANSPORT_LABEL[r.key]).join(', ');
+    return { tone: 'pass', html: `Data crossed the relay <b>end to end on every enabled transport</b> (${esc(list)}). For each one, two peers were forced to <code>iceTransportPolicy: relay</code>, both allocated a relay, and a <code>DataChannel</code> echoed through it — proving the relay carries media, not just that an allocation address was handed out.${note}${table}` };
+  }
+  if (evalRes.kind === 'mixed') {
+    const good = res.perTransport.filter((r) => r.ran && r.dataOk).map((r) => TRANSPORT_LABEL[r.key]);
+    const bad = res.perTransport.filter((r) => r.ran && !r.dataOk).map((r) => TRANSPORT_LABEL[r.key]);
+    return { tone: 'warn', html: `Data crossed the relay over <b>${esc(good.join(', '))}</b> but <b>not over ${esc(bad.join(', '))}</b>. The relay works, yet clients restricted to the failing transport(s) cannot use it. If <b>TLS</b> is among the failures, corporate/DPI networks — the very ones that need TURNS — will fail while your own tests look healthy.${note}${table}` };
   }
   if (evalRes.kind === 'noflow') {
-    return { tone: 'fail', html: `Both peers <b>allocated a relay</b> (<b class="mono">${esc(res.aRelay)}</b>, <b class="mono">${esc(res.bRelay)}</b>) but <b>no data crossed it</b>${res.timedOut ? ' (timed out)' : ''}. The allocation succeeds over the control port, yet media can't flow through the relay port. Classic causes: the coturn relay port range (<code>min-port</code>–<code>max-port</code>, e.g. <code>49152–65535/UDP</code>) isn't open inbound on the TURN public IP, or <code>allowed-peer-ip</code> denies the peer. <b>This is exactly the failure an allocation-only check cannot see.</b>` };
-  }
-  if (evalRes.kind === 'partial') {
-    return { tone: 'warn', html: `Both relays were allocated and ICE reported <code>connected</code>, but the <code>DataChannel</code> didn't echo in time. Likely a timing/MTU hiccup on the relay path — re-run; if it persists, inspect the relay port range and the coturn logs.` };
+    return { tone: 'fail', html: `Relays were <b>allocated</b> but <b>no data crossed them</b> on any transport${res.timedOut ? ' (timed out)' : ''}. The allocation succeeds over the control port, yet media can't flow through the relay port. Classic causes: the coturn relay port range (<code>min-port</code>–<code>max-port</code>, e.g. <code>49152–65535/UDP</code>) isn't open inbound on the TURN public IP, or <code>allowed-peer-ip</code> denies the peer. <b>This is exactly the failure an allocation-only check cannot see</b>, and it is the signature that shows up as <code>rp=0/rb=0</code> in the coturn session logs.${table}` };
   }
   if (evalRes.kind === 'auth') {
-    return { tone: 'fail', html: `The relay couldn't be allocated for the data-flow test because the <b>credential was rejected</b> (401/403). Fix the shared secret / TTL / username-password, then re-run.` };
+    return { tone: 'fail', html: `The relay couldn't be allocated because the <b>credential was rejected</b> (401/403). Fix the shared secret / TTL / username-password, then re-run.${table}` };
   }
-  return { tone: 'fail', html: `Couldn't establish a working relay pair for the data-flow test${res.timedOut ? ' (timed out)' : ''}. If the per-transport probes passed but this didn't, the server hands out allocation addresses but a usable relay path couldn't be set up from here.` };
+  return { tone: 'fail', html: `Couldn't establish a working relay pair on any transport${res.timedOut ? ' (timed out)' : ''}. If the per-transport reachability probes passed but this didn't, the server hands out allocation addresses but a usable relay path couldn't be set up from here.${table}` };
+}
+
+/* ---------------- loss / jitter ---------------- */
+function evaluateLoss(res) {
+  if (res.setupFailed) return { status: 'fail', kind: 'nosetup' };
+  if (!res.received) return { status: 'fail', kind: 'nodata' };
+  if (res.lossPct >= 5) return { status: 'fail', kind: 'lossy' };
+  if (res.lossPct > 0 || (res.jitterMs != null && res.jitterMs >= 30)) return { status: 'warn', kind: 'degraded' };
+  return { status: 'pass', kind: 'clean' };
+}
+
+function lossStats(res) {
+  if (!res.received) return '';
+  return `<table class="cand-table"><thead><tr><th>Sent</th><th>Received</th><th>Loss</th><th>RTT min/avg/max</th><th>Jitter</th></tr></thead>
+    <tbody><tr><td>${res.sent}</td><td>${res.received}</td><td>${res.lossPct}%</td>
+    <td>${res.minMs}/${res.avgMs}/${res.maxMs} ms</td><td>${res.jitterMs} ms</td></tr></tbody></table>`;
+}
+
+function explainLoss(evalRes, res) {
+  const via = res.path && res.path.relayProtocol ? ` The path ICE selected reached the TURN server over <b>${esc(res.path.relayProtocol)}</b>.` : '';
+  const why = ` This probe uses an <b>unreliable, unordered</b> <code>DataChannel</code> (<code>maxRetransmits: 0</code>) on purpose: the standard reliable channel would retransmit whatever the network drops, hiding exactly the loss that makes production RTP glitch.`;
+  if (evalRes.kind === 'clean') {
+    return { tone: 'pass', html: `<b>No loss</b> across ${res.sent} unreliable packets through the relay, jitter ${res.jitterMs} ms.${via}${why}${lossStats(res)}` };
+  }
+  if (evalRes.kind === 'degraded') {
+    return { tone: 'warn', html: `<b>${res.lossPct}% loss</b> and <b>${res.jitterMs} ms jitter</b> over ${res.sent} packets. Low but non-zero loss on an idle test is a warning sign — under real media load it typically gets worse. Re-run a few times: if it comes and goes, that matches an intermittent relay path rather than a hard fault.${via}${why}${lossStats(res)}` };
+  }
+  if (evalRes.kind === 'lossy') {
+    return { tone: 'fail', html: `<b>${res.lossPct}% of packets were lost</b> crossing the relay (${res.received}/${res.sent} returned), jitter ${res.jitterMs} ms. This is enough to break real-time media. Because the channel is unreliable, this is genuine network loss — not a retransmission artefact.${via}${why}${lossStats(res)}` };
+  }
+  if (evalRes.kind === 'nodata') {
+    return { tone: 'fail', html: `The relay pair came up but <b>not one of ${res.sent} packets returned</b>. Combined with a successful allocation, that is the <code>rp=0/rb=0</code> signature: the control path works and the data path does not.${why}` };
+  }
+  return { tone: 'fail', html: `Couldn't establish a relay pair for the loss test${res.timedOut ? ' (timed out)' : ''}. Fix the credential or transport first — the per-transport probes above say which.` };
+}
+
+/* ---------------- MTU ---------------- */
+function evaluateMtu(res) {
+  if (res.setupFailed) return { status: 'fail', kind: 'nosetup' };
+  if (!res.largestOk) return { status: 'fail', kind: 'nodata' };
+  if (res.firstFail == null) return { status: 'pass', kind: 'clean' };
+  // Anything that drops below a typical RTP video packet is a real problem.
+  if (res.firstFail <= 1200) return { status: 'fail', kind: 'small' };
+  return { status: 'warn', kind: 'cliff' };
+}
+
+function mtuTable(res) {
+  const rows = res.samples.map((s) => `<tr><td>${s.size} B</td>
+    <td>${s.ok ? '<span class="ctype ctype-relay">ok</span>' : '<span class="ctype ctype-fail">dropped</span>'}</td>
+    <td>${s.ms != null ? s.ms + ' ms' : '—'}</td></tr>`).join('');
+  return `<table class="cand-table"><thead><tr><th>Payload</th><th>Result</th><th>Echo</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function explainMtu(evalRes, res) {
+  const caveat = ` <b>Read this as a hint, not a measurement.</b> A <code>DataChannel</code> runs over SCTP, which does its own fragmentation and reassembly, so a lower-layer UDP fragmentation problem can be partly masked. The browser exposes no raw socket and no DF bit — a definitive answer needs <code>ping -M do -s &lt;size&gt;</code> from a host on the affected segment.`;
+  if (evalRes.kind === 'clean') {
+    return { tone: 'pass', html: `Every payload up to <b>${res.largestOk} B</b> crossed the relay, including RTP-sized (1200 B) and full-MTU (1500 B) packets. No size cliff on this path.${caveat}${mtuTable(res)}` };
+  }
+  if (evalRes.kind === 'small') {
+    return { tone: 'fail', html: `Payloads stop crossing at <b>${res.firstFail} B</b> — below the ~1200 B of a typical RTP video packet (largest that made it: <b>${res.largestOk} B</b>). Small control packets pass while real media does not, which is precisely how a path produces successful allocations and <code>rp=0/rb=0</code> sessions. NAT 1:1 plus edge DNAT is a classic trigger: the effective MTU shrinks and PMTUD breaks when the firewall drops the ICMP that would signal it.${caveat}${mtuTable(res)}` };
+  }
+  if (evalRes.kind === 'cliff') {
+    return { tone: 'warn', html: `Payloads cross up to <b>${res.largestOk} B</b> but fail from <b>${res.firstFail} B</b>. RTP-sized packets still get through, so ordinary media should work, but the headroom is thinner than a clean path — worth checking the MTU end to end if you also see loss.${caveat}${mtuTable(res)}` };
+  }
+  if (evalRes.kind === 'nodata') {
+    return { tone: 'fail', html: `Not even a 100-byte payload crossed the relay. The size dimension can't be assessed until basic data flow works — see the data-flow and loss probes.` };
+  }
+  return { tone: 'fail', html: `Couldn't establish a relay pair for the payload-size test${res.timedOut ? ' (timed out)' : ''}.` };
+}
+
+/* ---------------- soak ---------------- */
+function evaluateSoak(res) {
+  if (res.setupFailed) return { status: 'fail', kind: 'nosetup' };
+  if (!res.pongs) return { status: 'fail', kind: 'nodata' };
+  if (res.longestStallS >= 3) return { status: 'fail', kind: 'stalled' };
+  if (res.stalls) return { status: 'warn', kind: 'blips' };
+  return { status: 'pass', kind: 'steady' };
+}
+
+// Compact SVG sparkline of per-second echo health: a filled bar per tick,
+// muted when the second echoed and red when it didn't.
+function sparkline(ticks) {
+  if (!ticks.length) return '';
+  const W = 100, H = 26, n = ticks.length;
+  const bw = W / n;
+  const rtts = ticks.map((t) => t.rttMs).filter((v) => v != null);
+  const max = rtts.length ? Math.max.apply(null, rtts) : 1;
+  const bars = ticks.map((t, i) => {
+    const h = t.echoed ? Math.max(2, ((t.rttMs != null ? t.rttMs : 1) / (max || 1)) * (H - 2)) : H;
+    const fill = t.echoed ? 'var(--accent)' : 'var(--fail)';
+    const op = t.echoed ? '0.75' : '1';
+    return `<rect x="${(i * bw).toFixed(2)}" y="${(H - h).toFixed(2)}" width="${Math.max(0.6, bw - 0.25).toFixed(2)}" height="${h.toFixed(2)}" fill="${fill}" opacity="${op}"/>`;
+  }).join('');
+  return `<div class="spark"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Per-second relay echo timeline">${bars}</svg>
+    <div class="spark-axis mono"><span>0s</span><span>${n}s</span></div></div>`;
+}
+
+function explainSoak(evalRes, res) {
+  const via = res.path && res.path.relayProtocol ? ` Path selected: <b>${esc(res.path.relayProtocol)}</b>.` : '';
+  const spark = sparkline(res.ticks);
+  const why = ` The incident this looks for is <b>intermittent</b> — a sub-second echo has almost no chance of landing inside a bad window. Each bar is one second; height is round-trip time, red means that second produced no echo. Run this at different times of day and line the red bars up against the coturn logs by timestamp.`;
+  if (evalRes.kind === 'steady') {
+    return { tone: 'pass', html: `The relay carried traffic <b>continuously for ${res.seconds}s</b> — ${res.pongs}/${res.pings} echoes, no stalled second.${via}${why}${spark}` };
+  }
+  if (evalRes.kind === 'blips') {
+    return { tone: 'warn', html: `The relay stayed up for ${res.seconds}s but <b>${res.stalls} second(s) produced no echo</b> (longest run ${res.longestStallS}s), ${res.pongs}/${res.pings} total.${via} Brief blips on an idle path often precede the user-visible drops.${why}${spark}` };
+  }
+  if (evalRes.kind === 'stalled') {
+    return { tone: 'fail', html: `Traffic <b>stalled for up to ${res.longestStallS} consecutive seconds</b> (${res.stalls} bad seconds out of ${res.seconds}, ${res.pongs}/${res.pings} echoes).${via} That is a genuine interruption on the relay path, not a startup artefact — capture the wall-clock time of this run and cross-reference the coturn session logs for <code>rp=0/rb=0</code>.${why}${spark}` };
+  }
+  if (evalRes.kind === 'nodata') {
+    return { tone: 'fail', html: `The relay pair came up but no echo ever returned during the ${res.seconds}s soak — the control path works and the data path does not.` };
+  }
+  return { tone: 'fail', html: `Couldn't establish a relay pair for the soak test${res.timedOut ? ' (timed out)' : ''}.` };
+}
+
+/* ---------------- lifetime / silence gaps ---------------- */
+function evaluateGaps(res) {
+  if (res.setupFailed) return { status: 'fail', kind: 'nosetup' };
+  const base = res.marks[0];
+  if (!base || !base.ok) return { status: 'fail', kind: 'nobase' };
+  if (res.firstFailS == null) return { status: 'pass', kind: 'survives' };
+  if (res.firstFailS <= 120) return { status: 'fail', kind: 'firewall' };
+  if (res.firstFailS <= 300) return { status: 'fail', kind: 'permission' };
+  return { status: 'fail', kind: 'allocation' };
+}
+
+function gapsTable(res) {
+  const rows = res.marks.map((m) => `<tr>
+    <td>${m.seconds === 0 ? 'baseline' : 'after ' + m.seconds + 's silence'}</td>
+    <td>${m.ok ? '<span class="ctype ctype-relay">echo ok</span>' : '<span class="ctype ctype-fail">no echo</span>'}</td>
+    <td>${m.ms != null ? m.ms + ' ms' : '—'}</td></tr>`).join('');
+  return `<table class="cand-table"><thead><tr><th>Stage</th><th>Result</th><th>Echo</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function explainGaps(evalRes, res) {
+  const ref = ` Reference lifetimes (RFC 8656): <b>permission 5 min</b>, <b>channel binding and allocation 10 min</b>. Note that ICE consent freshness keeps probing the selected pair every few seconds, so the silence is never total at the network layer — this bounds the result rather than invalidating it.`;
+  if (evalRes.kind === 'survives') {
+    const longest = res.marks[res.marks.length - 1];
+    return { tone: 'pass', html: `The relay still echoed after <b>every silence tested</b>, up to <b>${longest.seconds}s</b>. Neither an idle-timeout on the path nor an un-refreshed TURN permission is breaking this connection within that window.${ref}${gapsTable(res)}` };
+  }
+  if (evalRes.kind === 'firewall') {
+    return { tone: 'fail', html: `Data stopped flowing after <b>${res.firstFailS}s of silence</b>. That is far short of any TURN lifetime, so the TURN server is not the culprit — something on the path is dropping the idle mapping. Look at <b>firewall/NAT conntrack timeouts</b> on the DNAT device and between the client segment and the TURN VM, and at the client's keepalive interval.${ref}${gapsTable(res)}` };
+  }
+  if (evalRes.kind === 'permission') {
+    return { tone: 'fail', html: `Data stopped flowing after <b>${res.firstFailS}s of silence</b> — right around the <b>5-minute permission lifetime</b>. This points at a TURN <b>permission expiring without being refreshed</b>, rather than a network timeout. Check that the client keeps the permission alive, and look for the corresponding refresh activity in the coturn logs.${ref}${gapsTable(res)}` };
+  }
+  if (evalRes.kind === 'allocation') {
+    return { tone: 'fail', html: `Data stopped flowing after <b>${res.firstFailS}s of silence</b> — around the <b>10-minute allocation / channel-binding lifetime</b>. That suggests the allocation was not refreshed, or the server dropped it early. Inspect the coturn allocation lifetime settings and the refresh traffic in its logs.${ref}${gapsTable(res)}` };
+  }
+  if (evalRes.kind === 'nobase') {
+    return { tone: 'fail', html: `The baseline echo failed before any silence was applied, so there is nothing to time out — fix basic relay data flow first (see the data-flow probe).` };
+  }
+  return { tone: 'fail', html: `Couldn't establish a relay pair for the lifetime test${res.timedOut ? ' (timed out)' : ''}.` };
 }
 
 /* ---------------- per-transport url builders ---------------- */
@@ -238,15 +753,26 @@ function turnUrl(key) {
   if (key === 'udp') return `turn:${host}:${port}?transport=udp`;
   if (key === 'tcp') return `turn:${host}:${port}?transport=tcp`;
   if (key === 'tls') return `turns:${host}:${tls}?transport=tcp`;
-  if (key === 'flow') return `relay ↔ relay · turn:${host}`;
+  if (key === 'flow') return `each transport separately · relay ↔ relay`;
+  if (key === 'loss') return `${LOSS_PINGS} unreliable packets · relay ↔ relay`;
+  if (key === 'mtu') return `payload ${MTU_SIZES[0]}–${MTU_SIZES[MTU_SIZES.length - 1]} B · relay ↔ relay`;
+  if (key === 'soak') return `${state.soakSeconds}s sustained · relay ↔ relay`;
+  if (key === 'gaps') return `silence ${state.gapMarks}s · relay ↔ relay`;
   return state.stun;
 }
 
-// iceServers for the data-flow test: every enabled TURN transport with the
-// resolved credential, mirroring what a real client would offer.
+// iceServers for the data probes: every enabled TURN transport with the resolved
+// credential, mirroring what a real client would offer. The flow probe does NOT
+// use this — it deliberately isolates one transport at a time (see flowProbe).
 function flowIceServers(enabled, cred) {
-  const urls = ['udp', 'tcp', 'tls'].filter((k) => enabled[k]).map((k) => turnUrl(k));
+  const urls = FLOW_TRANSPORTS.filter((k) => enabled[k]).map((k) => turnUrl(k));
   return [{ urls, username: cred.username, credential: cred.password }];
+}
+
+function parseGapMarks(raw) {
+  return String(raw || '').split(',')
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 900);
 }
 
 /* ---------------- NAT detection (best effort) ---------------- */
@@ -430,8 +956,34 @@ function computeVerdict(results, natInfo, credProvided) {
   chips.push(turnChip('tcp'));
   if (flowRan) chips.push(chip('DATA FLOW', flowEval.status === 'pass' ? 'pass' : flowEval.status === 'warn' ? 'warn' : 'fail'));
   chips.push(turnChip('tls'));
+  const QUALITY_CHIP = { loss: 'LOSS', mtu: 'MTU', soak: 'SOAK', gaps: 'LIFETIME' };
+  ['loss', 'mtu', 'soak', 'gaps'].forEach((k) => {
+    if (ran(k)) chips.push(chip(QUALITY_CHIP[k], results[k].eval.status));
+  });
   if (natInfo) chips.push(chip('NAT: ' + (natInfo.label || 'unknown'),
     natInfo.type === 'address-dependent' ? 'warn' : natInfo.type === 'endpoint-independent' ? 'pass' : 'skip'));
+
+  // The quality probes (loss, MTU, soak, lifetime) test a relay that already
+  // carries data. They cannot say "the relay works" — only that a working relay
+  // degrades. So they refine a passing flow verdict rather than replacing it.
+  const QUALITY_SUMMARY = {
+    loss: (r) => r.eval.kind === 'lossy' ? `${r.res.lossPct}% packet loss through the relay`
+      : r.eval.kind === 'degraded' ? `${r.res.lossPct}% loss / ${r.res.jitterMs} ms jitter` : null,
+    mtu: (r) => r.eval.kind === 'small' ? `payloads over ${r.res.firstFail} B are dropped — below RTP size`
+      : r.eval.kind === 'cliff' ? `payloads over ${r.res.firstFail} B are dropped` : null,
+    soak: (r) => r.eval.kind === 'stalled' ? `traffic stalled up to ${r.res.longestStallS}s during the soak`
+      : r.eval.kind === 'blips' ? `${r.res.stalls} stalled second(s) during the soak` : null,
+    gaps: (r) => r.res.firstFailS != null ? `data stopped after ${r.res.firstFailS}s of silence` : null,
+  };
+  const qualityIssues = [];
+  let qualityFail = false;
+  ['loss', 'mtu', 'soak', 'gaps'].forEach((k) => {
+    if (!ran(k)) return;
+    const msg = QUALITY_SUMMARY[k](results[k]);
+    if (!msg) return;
+    qualityIssues.push(msg);
+    if (results[k].eval.status === 'fail') qualityFail = true;
+  });
 
   let status, title, text;
 
@@ -439,15 +991,28 @@ function computeVerdict(results, natInfo, credProvided) {
   // the relay carries media, which allocation-only reachability can't. When it
   // ran, it dominates the verdict.
   if (flowRan && flowEval.kind === 'flow') {
-    status = 'pass';
-    title = 'TURN relay verified end to end';
-    // The flow test can ride whichever transport succeeded, so surface any
-    // individual transport that failed instead of hiding it behind the pass.
-    const blocked = ['udp', 'tcp', 'tls'].filter((k) => ran(k) && !reachOk(k)).map((k) => 'TURN/' + k.toUpperCase());
-    text = 'Data actually traversed the relay — two peers were forced to relay-only and a DataChannel echoed through it. Allocation, permissions and the relay port path all work.';
-    text += blocked.length
-      ? ' Note: ' + blocked.join(', ') + ' failed individually, so the relay is riding only the transport(s) that passed — fix them for redundancy, or clients limited to that transport will still fail.'
-      : ' If specific clients still fail, the cause is their local network/NAT, not this server.';
+    const carried = results.flow.res.perTransport.filter((r) => r.ran).map((r) => TRANSPORT_LABEL[r.key]).join(', ');
+    if (qualityFail) {
+      status = 'fail';
+      title = 'Relay carries data but degrades';
+      text = 'Every enabled transport (' + carried + ') carried data end to end, so allocation, permissions and the relay port path all work — but the relay does not hold up under scrutiny: ' + qualityIssues.join('; ') + '. A relay that allocates and then degrades is exactly what users experience as intermittent drops while reachability checks stay green.';
+    } else if (qualityIssues.length) {
+      status = 'warn';
+      title = 'Relay verified, with warnings';
+      text = 'Data traversed the relay on every enabled transport (' + carried + '), but the quality probes flagged: ' + qualityIssues.join('; ') + '. Worth re-running at different times — mild degradation on an idle test often becomes user-visible under real media load.';
+    } else {
+      status = 'pass';
+      title = 'TURN relay verified end to end';
+      text = 'Data actually traversed the relay on every enabled transport (' + carried + ') — each one probed separately, two peers forced to relay-only, bytes echoed through. Allocation, permissions and the relay port path all work. If specific clients still fail, the cause is their local network/NAT, not this server.';
+    }
+  } else if (flowRan && flowEval.kind === 'mixed') {
+    const good = results.flow.res.perTransport.filter((r) => r.ran && r.dataOk).map((r) => TRANSPORT_LABEL[r.key]);
+    const bad = results.flow.res.perTransport.filter((r) => r.ran && !r.dataOk).map((r) => TRANSPORT_LABEL[r.key]);
+    status = 'warn';
+    title = 'Relay carries data on some transports only';
+    text = 'Data crossed the relay over ' + good.join(', ') + ' but not over ' + bad.join(', ') + '. The relay works, yet any client restricted to a failing transport cannot use it.'
+      + (bad.indexOf('TLS') >= 0 ? ' TLS is among the failures — corporate and DPI-filtered networks, the exact clients that need TURNS, will fail while a combined test would have looked healthy.' : '')
+      + (qualityIssues.length ? ' The quality probes also flagged: ' + qualityIssues.join('; ') + '.' : '');
   } else if (flowRan && flowEval.kind === 'noflow') {
     status = 'fail';
     title = 'Relay allocates but carries no data';
@@ -532,27 +1097,43 @@ function chip(label, s) {
 let lastRun = null;
 
 function buildReport(results, natInfo, cred, verdict) {
-  const PROBE_LABEL = { stun: 'STUN reachability & NAT', udp: 'TURN over UDP', tcp: 'TURN over TCP', tls: 'TURN over TLS', flow: 'TURN relay data flow' };
+  const PROBE_LABEL = { stun: 'STUN reachability & NAT', udp: 'TURN over UDP', tcp: 'TURN over TCP', tls: 'TURN over TLS',
+    flow: 'TURN relay data flow', loss: 'Relay packet loss & jitter', mtu: 'Relay payload size (MTU)',
+    soak: 'Relay soak — sustained flow', gaps: 'TURN lifetime & silence gaps' };
   const resultWord = (ev) => ev.kind === 'ok' ? 'pass (relay)' : ev.kind === 'flow' ? 'pass (data)' : ev.kind === 'reachable' ? 'pass (reachable)'
-    : ev.kind === 'noflow' ? 'fail (no data)' : ev.kind === 'inconclusive' ? 'inconclusive' : ev.kind === 'auth' ? 'fail (401)'
+    : ev.kind === 'mixed' ? 'partial (some transports)' : ev.kind === 'noflow' ? 'fail (no data)'
+    : ev.kind === 'inconclusive' ? 'inconclusive' : ev.kind === 'auth' ? 'fail (401)'
     : ev.status === 'pass' ? 'pass' : ev.status === 'warn' ? 'warn' : 'fail';
   const stunRes = results.stun && results.stun.res;
   const srflxes = stunRes ? stunRes.candidates.filter((c) => c.type === 'srflx' && c.address) : [];
   const v4 = srflxes.find((c) => c.address.indexOf(':') < 0);
   const v6 = srflxes.find((c) => c.address.indexOf(':') >= 0);
 
-  const probes = ['stun', 'udp', 'tcp', 'flow', 'tls'].filter((k) => results[k] && results[k].ran).map((k) => {
+  const probes = ['stun', 'udp', 'tcp', 'flow', 'tls', 'loss', 'mtu', 'soak', 'gaps'].filter((k) => results[k] && results[k].ran).map((k) => {
     const R = results[k], ev = R.eval, res = R.res;
     let detail;
     if (k === 'stun') {
       const s = res.candidates.find((c) => c.type === 'srflx');
       detail = s ? 'public ' + s.address + ':' + s.port : 'no srflx candidate';
     } else if (k === 'flow') {
-      if (ev.kind === 'flow') detail = 'data echoed through relay ' + res.aRelay + ' ↔ ' + res.bRelay + ' (' + res.firstMs + ' ms)';
-      else if (ev.kind === 'noflow') detail = 'relay allocated (' + res.aRelay + ', ' + res.bRelay + ') but no data traversed';
-      else if (ev.kind === 'partial') detail = 'connected but DataChannel did not echo';
-      else if (ev.kind === 'auth') detail = 'credential rejected (401/403)';
-      else detail = res.timedOut ? 'no relay / timed out' : 'no relay allocated';
+      const per = res.perTransport.filter((r) => r.ran)
+        .map((r) => TRANSPORT_LABEL[r.key] + '=' + (r.dataOk ? 'data ok' + (r.ms != null ? ' ' + r.ms + 'ms' : '') : (r.connected ? 'no echo' : 'no relay')));
+      detail = per.length ? per.join(', ') : 'no transport enabled';
+    } else if (k === 'loss') {
+      detail = res.setupFailed ? 'relay pair could not be established'
+        : res.received ? res.lossPct + '% loss (' + res.received + '/' + res.sent + '), jitter ' + res.jitterMs + ' ms, RTT ' + res.minMs + '/' + res.avgMs + '/' + res.maxMs + ' ms'
+        : 'no packets returned (' + res.sent + ' sent)';
+    } else if (k === 'mtu') {
+      detail = res.setupFailed ? 'relay pair could not be established'
+        : res.largestOk ? 'largest payload through relay ' + res.largestOk + ' B' + (res.firstFail != null ? ', dropped from ' + res.firstFail + ' B' : ', no cliff up to ' + MTU_SIZES[MTU_SIZES.length - 1] + ' B')
+        : 'not even the smallest payload crossed';
+    } else if (k === 'soak') {
+      detail = res.setupFailed ? 'relay pair could not be established'
+        : res.seconds + 's soak, ' + res.pongs + '/' + res.pings + ' echoes, ' + res.stalls + ' stalled second(s), longest stall ' + res.longestStallS + 's';
+    } else if (k === 'gaps') {
+      detail = res.setupFailed ? 'relay pair could not be established'
+        : res.firstFailS != null ? 'data stopped after ' + res.firstFailS + 's of silence'
+        : 'survived silence up to ' + (res.marks.length ? res.marks[res.marks.length - 1].seconds : 0) + 's';
     } else if (ev.kind === 'ok') {
       const relay = res.candidates.find((c) => c.type === 'relay');
       detail = relay ? 'relay ' + relay.address + ':' + relay.port : 'relay allocated';
@@ -659,7 +1240,8 @@ function diagLog(msg, kind) {
 }
 
 /* ---------------- orchestration ---------------- */
-const state = { authMode: 'secret', host: '', port: 3478, tlsPort: 5349, stun: '', running: false };
+const state = { authMode: 'secret', host: '', port: 3478, tlsPort: 5349, stun: '', running: false,
+                soakSeconds: DEFAULT_SOAK_SECONDS, gapMarks: DEFAULT_GAP_MARKS };
 
 function val(id) { return $('#' + id).value; }
 
@@ -668,6 +1250,10 @@ function readConfig() {
   state.port = val('turnPort').trim() || '3478';
   state.tlsPort = val('tlsPort').trim() || '5349';
   state.stun = val('stunServer').trim();
+  const soak = parseInt(val('soakSeconds'), 10);
+  state.soakSeconds = Number.isFinite(soak) && soak > 0 ? Math.min(soak, 900) : DEFAULT_SOAK_SECONDS;
+  const marks = parseGapMarks(val('gapMarks'));
+  state.gapMarks = marks.length ? marks.join(',') : DEFAULT_GAP_MARKS;
 }
 
 function validate() {
@@ -719,16 +1305,22 @@ async function run() {
     tcp: $('#testTcp').checked,
     tls: $('#testTls').checked,
     flow: $('#testFlow').checked,
+    loss: $('#testLoss').checked,
+    mtu: $('#testMtu').checked,
+    soak: $('#testSoak').checked,
+    gaps: $('#testGaps').checked,
   };
-  if (enabled.flow && !cred.provided) {
-    diagLog('Relay data-flow — skipped (needs a credential to allocate a relay and push bytes through it)', 'warn');
-  } else if (enabled.flow && cred.provided && !(enabled.udp || enabled.tcp || enabled.tls)) {
-    diagLog('Relay data-flow — skipped (enable at least one TURN transport to carry it)', 'warn');
-  }
-  // The data-flow test needs a credential (no allocation without auth) and at
+  const anyTransport = enabled.udp || enabled.tcp || enabled.tls;
+  const probeName = (k) => (TEST_DEFS.find((t) => t.key === k) || {}).name || k;
+  // Every data probe needs a credential (no allocation without auth) and at
   // least one TURN transport enabled to carry it.
+  DATA_PROBES.forEach((k) => {
+    if (!enabled[k]) return;
+    if (!cred.provided) diagLog(probeName(k) + ' — skipped (needs a credential to allocate a relay and push bytes through it)', 'warn');
+    else if (!anyTransport) diagLog(probeName(k) + ' — skipped (enable at least one TURN transport to carry it)', 'warn');
+  });
   const defs = TEST_DEFS.filter((d) => {
-    if (d.key === 'flow') return enabled.flow && cred.provided && (enabled.udp || enabled.tcp || enabled.tls);
+    if (DATA_PROBES.indexOf(d.key) >= 0) return enabled[d.key] && cred.provided && anyTransport;
     return enabled[d.key];
   }).map((d) => ({ ...d, url: turnUrl(d.key) }));
   renderCards(defs);
@@ -761,21 +1353,60 @@ async function run() {
       evalRes = { status: srflx ? 'pass' : 'warn', kind: srflx ? 'ok' : 'nostun' };
       explain = explainStun(evalRes, res, natInfo);
     } else if (d.key === 'flow') {
-      diagLog('Relay data-flow — forcing two peers through the relay and echoing a DataChannel', 'run');
-      res = await relayFlowProbe({ iceServers: flowIceServers(enabled, cred) });
+      diagLog('Relay data-flow — probing each transport separately so UDP cannot mask TCP/TLS', 'run');
+      res = await flowProbe({ enabled, cred });
+      res.perTransport.filter((r) => r.ran).forEach((r) => {
+        if (r.dataOk) diagLog('  ' + TRANSPORT_LABEL[r.key] + ' — data crossed the relay ' + r.aRelay + ' ↔ ' + r.bRelay + ' (' + r.ms + ' ms)', 'ok');
+        else if (r.connected) diagLog('  ' + TRANSPORT_LABEL[r.key] + ' — relay allocated but NO data crossed (relay port range / peer ACL)', 'no');
+        else diagLog('  ' + TRANSPORT_LABEL[r.key] + ' — no relay allocated' + (r.timedOut ? ' (timed out)' : ''), 'no');
+      });
       evalRes = evaluateFlow(res);
-      if (evalRes.kind === 'flow') {
-        diagLog('Relay data-flow — bytes crossed the relay ' + res.aRelay + ' ↔ ' + res.bRelay + ' (' + res.firstMs + ' ms)', 'ok');
-      } else if (evalRes.kind === 'noflow') {
-        diagLog('Relay data-flow — relay allocated but NO data crossed (relay port range / peer ACL blocked)', 'no');
-      } else if (evalRes.kind === 'partial') {
-        diagLog('Relay data-flow — connected but DataChannel did not echo in time', 'warn');
-      } else if (evalRes.kind === 'auth') {
-        diagLog('Relay data-flow — credential rejected (401/403)', 'no');
-      } else {
-        diagLog('Relay data-flow — no relay allocated' + (res.timedOut ? ' (timed out)' : ''), 'no');
-      }
       explain = explainFlow(evalRes, res);
+    } else if (d.key === 'loss') {
+      diagLog('Loss & jitter — ' + LOSS_PINGS + ' packets over an unreliable DataChannel (SCTP retransmission off)', 'run');
+      res = await lossProbe({ iceServers: flowIceServers(enabled, cred) });
+      evalRes = evaluateLoss(res);
+      if (res.setupFailed) diagLog('Loss & jitter — relay pair could not be established', 'no');
+      else if (!res.received) diagLog('Loss & jitter — NOT ONE of ' + res.sent + ' packets returned', 'no');
+      else diagLog('Loss & jitter — ' + res.lossPct + '% loss (' + res.received + '/' + res.sent + '), jitter ' + res.jitterMs + ' ms, RTT avg ' + res.avgMs + ' ms',
+        evalRes.status === 'pass' ? 'ok' : evalRes.status === 'warn' ? 'warn' : 'no');
+      explain = explainLoss(evalRes, res);
+    } else if (d.key === 'mtu') {
+      diagLog('Payload size — walking ' + MTU_SIZES[0] + '→' + MTU_SIZES[MTU_SIZES.length - 1] + ' B through the relay to find a cliff', 'run');
+      res = await mtuProbe({ iceServers: flowIceServers(enabled, cred) });
+      evalRes = evaluateMtu(res);
+      if (res.setupFailed) diagLog('Payload size — relay pair could not be established', 'no');
+      else if (res.firstFail != null) diagLog('Payload size — largest through relay ' + res.largestOk + ' B, dropped from ' + res.firstFail + ' B',
+        evalRes.status === 'fail' ? 'no' : 'warn');
+      else diagLog('Payload size — no cliff up to ' + res.largestOk + ' B', 'ok');
+      explain = explainMtu(evalRes, res);
+    } else if (d.key === 'soak') {
+      diagLog('Soak — holding the relay open for ' + state.soakSeconds + 's and sampling getStats every second', 'run');
+      res = await soakProbe({
+        iceServers: flowIceServers(enabled, cred), seconds: state.soakSeconds,
+        onTick: (tick, total) => {
+          splashCurrent(d.name + ' — ' + tick.t + '/' + total + 's');
+          if (!tick.echoed) diagLog('  soak t=' + tick.t + 's — no echo this second', 'no');
+        },
+      });
+      evalRes = evaluateSoak(res);
+      if (res.setupFailed) diagLog('Soak — relay pair could not be established', 'no');
+      else diagLog('Soak — ' + res.pongs + '/' + res.pings + ' echoes, ' + res.stalls + ' stalled second(s), longest stall ' + res.longestStallS + 's',
+        evalRes.status === 'pass' ? 'ok' : evalRes.status === 'warn' ? 'warn' : 'no');
+      explain = explainSoak(evalRes, res);
+    } else if (d.key === 'gaps') {
+      const marks = parseGapMarks(state.gapMarks);
+      diagLog('Lifetime — testing silences of ' + marks.join('s, ') + 's against TURN permission (300s) and allocation (600s) lifetimes', 'run');
+      res = await gapsProbe({
+        iceServers: flowIceServers(enabled, cred), marks,
+        onMark: (m) => {
+          if (m.pending) { splashCurrent(d.name + ' — waiting ' + m.seconds + 's in silence'); diagLog('  going silent for ' + m.seconds + 's…', 'dim'); return; }
+          if (m.seconds === 0) diagLog('  baseline echo ' + (m.ok ? m.ms + ' ms' : 'FAILED'), m.ok ? 'ok' : 'no');
+          else diagLog('  after ' + m.seconds + 's silence — ' + (m.ok ? 'echo ok (' + m.ms + ' ms)' : 'NO ECHO'), m.ok ? 'ok' : 'no');
+        },
+      });
+      evalRes = evaluateGaps(res);
+      explain = explainGaps(evalRes, res);
     } else {
       diagLog(d.name + (cred.provided ? ' — allocating relay via ' : ' — probing reachability via ') + turnUrl(d.key), 'run');
       const iceServers = [{ urls: turnUrl(d.key), username: cred.username, credential: cred.password }];
@@ -835,7 +1466,7 @@ async function run() {
 }
 
 /* ---------------- persistence (no secrets) ---------------- */
-const SAVE_KEYS = ['turnHost', 'turnPort', 'tlsPort', 'stunServer', 'ttl', 'suffix', 'username'];
+const SAVE_KEYS = ['turnHost', 'turnPort', 'tlsPort', 'stunServer', 'ttl', 'suffix', 'username', 'soakSeconds', 'gapMarks'];
 function saveConfig() {
   const o = { authMode: state.authMode };
   SAVE_KEYS.forEach((k) => (o[k] = val(k)));
@@ -854,10 +1485,12 @@ function hasAdvancedValues() {
   const nonDefault = (id, def) => { const v = val(id).trim(); return v !== '' && v !== def; };
   return nonDefault('turnPort', '3478') || nonDefault('tlsPort', '5349')
     || nonDefault('stunServer', 'stun:stun.l.google.com:19302') || nonDefault('ttl', '3600')
+    || nonDefault('soakSeconds', String(DEFAULT_SOAK_SECONDS)) || nonDefault('gapMarks', DEFAULT_GAP_MARKS)
     || filled('sharedSecret') || filled('username') || filled('password')
     || filled('suffix') || filled('reference')
     || state.authMode === 'direct'
-    || !$('#testStun').checked || !$('#testUdp').checked || !$('#testTcp').checked || $('#testTls').checked || !$('#testFlow').checked;
+    || !$('#testStun').checked || !$('#testUdp').checked || !$('#testTcp').checked || $('#testTls').checked || !$('#testFlow').checked
+    || !$('#testLoss').checked || !$('#testMtu').checked || $('#testSoak').checked || $('#testGaps').checked;
 }
 
 /* ---------------- UI wiring ---------------- */

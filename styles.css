@@ -245,6 +245,11 @@ input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin
 .auth-pane.is-hidden { display: none; }
 
 /* ---------- checkboxes ---------- */
+.checks-title {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-display); font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.14em; color: var(--faint); margin: 16px 0 8px;
+}
 .checks { display: grid; gap: 4px; }
 .check {
   display: flex; align-items: center; gap: 11px; cursor: pointer;
@@ -422,6 +427,21 @@ input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin
 .ctype-srflx { color: var(--info); background: rgba(79,176,232,0.1); }
 .ctype-host  { color: var(--muted); background: var(--surface-3); }
 .ctype-prflx { color: var(--warn); background: var(--warn-dim); }
+.ctype-fail  { color: var(--fail); background: var(--fail-dim); }
+
+/* Tables and sparklines nested inside an explanation block sit tighter than
+   the standalone ones below it. */
+.test-explain .cand-table { margin: 12px 0 2px; }
+.test-explain .spark { margin: 12px 0 2px; }
+
+/* Per-second relay timeline for the soak probe: one bar per second, height is
+   round-trip time, red marks a second that produced no echo. */
+.spark { margin-top: 12px; }
+.spark svg {
+  display: block; width: 100%; height: 46px;
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: var(--radius-xs);
+}
+.spark-axis { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--faint); margin-top: 4px; }
 
 .err-line {
   display: flex; gap: 9px; align-items: baseline; font-family: var(--font-mono); font-size: 11.5px;
